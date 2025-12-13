@@ -617,7 +617,7 @@ class SafeModel(nn.Module):
 
 ## Location Tracking (`@tracked`)
 
-The `@tracked` decorator injects `_fx_path` into submodules for automatic location attribution:
+`@tracked` injects an `_fx_path` attribute into submodules so you can pass `self.submodule` to TorchGuard helpers; the decorator handles wiring and registration.
 
 ```python
 @tracked
@@ -627,12 +627,54 @@ class TransformerBlock(nn.Module):
         self.attention = nn.MultiheadAttention(dim, num_heads)  # _fx_path = "attention"
         self.ffn = nn.Sequential(                               # _fx_path = "ffn"
             nn.Linear(dim, dim * 4),                            # _fx_path = "ffn.0"
-            nn.GELU(),                                          # _fx_path = "ffn.1"
+            nn.GELU(),                                          # stateless — no _fx_path
             nn.Linear(dim * 4, dim),                            # _fx_path = "ffn.2"
         )
 ```
 
-When you pass a module to `flag_nan`, `push`, or `fix`, the location is extracted automatically.
+Usage inside compiled code:
+```python
+def forward(self, x):
+    f = err.new(x)
+    x = self.attention(x)
+    f = flag_nan(x, self.attention, f)   # _fx_path resolved automatically
+    x = self.ffn[0](x)
+    f = flag_nan(x, self.ffn[0], f)
+    return x, f
+```
+
+### How location IDs work
+
+The `@tracked` pass builds a module tree and prunes it to only parameter-containing modules (e.g., `nn.Linear`, `nn.Conv2d`, `nn.LayerNorm`, `nn.Embedding`). Stateless ops (e.g., `GELU`, `ReLU`, `Dropout`) are skipped to save ID space.
+
+>Rationale: learnable modules are the common sources of numerical instability (weight/grad issues); stateless ops just propagate inputs. By tracking only "unsafe" components, errors are attributed to root causes, not symptoms. For example, if an activation output is NaN, the error is attributed to the preceding parameter-containing layer that produced it.
+
+The pruned modules are assigned sequential 10-bit IDs (0–1023) via deterministic depth-first traversal. A registry maps ID ↔ `_fx_path` so `flags.repr()` and `flags.summary()` can show human names at the Python boundary.
+
+### What happens if you exceed 1024 modules
+
+When a model has more parameter-containing modules than available IDs (1024 slots), TorchGuard **adaptively prunes the module tree** instead of using hash collisions. The pruning algorithm finds a depth cutoff where modules at or shallower than that depth get unique IDs; deeper modules are collapsed and share their ancestor's ID. Example: if pruning happens at depth 2, `encoder.layer.0.attn.q` and `encoder.layer.0.attn.k` both inherit the ID of `encoder.layer.0`. This preserves granularity for the most important (shallowest) parts of your model while collapsing detail in deeper subtrees.
+
+### Workarounds for very deep models
+
+You can influence pruning via `WeightedLocationTree`: set high weights on important paths (e.g., classifier head) to preserve them at deeper levels while collapsing other paths.
+
+- Use `WeightedLocationTree` to manually specify which module subtrees should be preserved:
+  ```python
+  from torchguard.src.core.location.tree import WeightedLocationTree
+  tree = WeightedLocationTree(max_locations=1024)
+  tree.set_weight("head.*", 10.0)           # Preserve classifier granularity
+  tree.set_weight("encoder.layer*", 1.0)   # Collapse encoder layers
+  ```
+- Use manual location IDs for critical checks:
+  ```python
+  f = push(f, err.NAN, location=42, where=torch.isnan(x).any(dim=-1))
+  ```
+- Restructure your model with blocks/containers to reduce the total number of tracked modules.
+
+> Note:
+> ID assignment is deterministic across runs for the same model structure.
+> Registry reverse-lookup is used only at the Python boundary; all in-graph operations use numeric IDs (no Python lookups inside compiled regions).
 
 ---
 
