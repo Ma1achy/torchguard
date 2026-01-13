@@ -32,6 +32,7 @@ if has_err(f):
 * [Core Concepts](#core-concepts)
 * [API Reference](#api-reference)
 * [Location Tracking](#location-tracking-tracked)
+* [Tensor Typing System](#tensor-typing-system)
 * [Configuration](#configuration)
 * [Performance](#performance-benchmarks)
 * [When NOT to Use](#when-not-to-use-torchguard)
@@ -675,6 +676,112 @@ You can influence pruning via `WeightedLocationTree`: set high weights on import
 > Note:
 > ID assignment is deterministic across runs for the same model structure.
 > Registry reverse-lookup is used only at the Python boundary; all in-graph operations use numeric IDs (no Python lookups inside compiled regions).
+
+---
+
+## Tensor Typing System
+
+TorchGuard includes a complete tensor typing system for type-safe annotations with runtime validation.
+
+```python
+from torchguard.typing import Tensor, Dim, Broadcast, float32_t, int64_t, error_t, type_cast
+from torchguard import tracked, tensorcheck
+```
+
+### Basic Usage
+
+```python
+from torchguard.typing import Tensor, float32_t, int64_t, Dim
+
+@tracked
+class MyModel(nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.linear = nn.Linear(in_features, out_features)
+    
+    @tensorcheck
+    def forward(
+        self,
+        x: Tensor[float32_t, ("batch", Dim.in_features)],
+    ) -> tuple[Tensor[float32_t, ("batch", Dim.out_features)], Tensor[error_t, ("batch", "num_words")]]:
+        f = err.new(x)
+        out = self.linear(x)
+        f = flag_nan(out, self.linear, f)
+        return out, f
+```
+
+### Tensor Annotation Syntax
+
+```python
+Tensor[dtype, shape]
+Tensor[dtype, shape, device]
+Tensor[dtype, shape, device, requires_grad]
+```
+
+**Shape specifications:**
+- **Literal integers**: `Tensor[float32_t, (32, 512)]` - exact dimensions
+- **Named dimensions**: `Tensor[float32_t, ("batch", "features")]` - tracked across tensors
+- **Instance attributes**: `Tensor[float32_t, ("N", Dim.hidden_size)]` - resolved from `self`
+- **Ellipsis**: `Tensor[float32_t, (..., "seq", "hidden")]` - variable batch dimensions
+- **Broadcast marker**: `Tensor[float32_t, (Broadcast, Dim.features)]` - broadcast-compatible
+
+### Dtype Aliases
+
+| Alias | PyTorch dtype |
+|-------|--------------|
+| `float32_t` | `torch.float32` |
+| `float64_t` | `torch.float64` |
+| `float16_t` | `torch.float16` |
+| `bfloat16_t` | `torch.bfloat16` |
+| `int64_t` | `torch.int64` |
+| `int32_t` | `torch.int32` |
+| `int8_t` | `torch.int8` |
+| `bool_t` | `torch.bool` |
+| `error_t` | `torch.int64` (error flags) |
+
+### Type-Safe Casting
+
+```python
+from torchguard.typing import type_cast, float32_t
+
+# Returns Result[Tensor, Error]
+result = type_cast[float32_t](int_tensor)
+if result.is_ok():
+    float_tensor = result.unwrap()
+else:
+    print(f"Cast failed: {result.unwrap_err()}")
+```
+
+### Dim and Broadcast
+
+```python
+from torchguard.typing import Tensor, Dim, Broadcast, float32_t
+
+class Encoder(nn.Module):
+    def __init__(self, hidden_size: int):
+        self.hidden_size = hidden_size
+    
+    @tensorcheck
+    def forward(
+        self,
+        x: Tensor[float32_t, ("batch", "seq", Dim.hidden_size)],  # Dim.hidden_size → self.hidden_size
+        bias: Tensor[float32_t, (Broadcast, Dim.hidden_size)],    # Broadcast-compatible
+    ) -> Tensor[float32_t, ("batch", "seq", Dim.hidden_size)]:
+        return x + bias
+```
+
+### @tensorcheck Decorator
+
+Validates tensor shapes and dtypes at runtime (skipped during `torch.compile`):
+
+```python
+@tensorcheck                          # Default: validates shapes/dtypes + auto-detects NaN/Inf
+@tensorcheck(auto_detect=True)        # Same as default
+@tensorcheck(auto_detect=False)       # Validation only, no NaN/Inf detection
+@tensorcheck(auto_detect={err.NAN})   # Only detect NaN
+```
 
 ---
 
