@@ -589,7 +589,7 @@ class _CastCallable:
         self.torch_dtype = torch_dtype
         self.type_alias = type_alias
     
-    def __call__(self, tensor: 'torch.Tensor') -> 'Result[torch.Tensor, Error]':
+    def __call__(self, tensor: 'torch.Tensor') -> 'Result[torch.Tensor, ValidationError]':
         """
         Cast tensor to the target dtype (returns Result).
         
@@ -597,28 +597,18 @@ class _CastCallable:
             tensor (torch.Tensor): Tensor to cast
         
         Returns:
-            (Result[torch.Tensor, Error]): Ok(casted_tensor) on success, Err on failure
+            (Result[torch.Tensor, ValidationError]): Ok(casted_tensor) on success, Err on failure
         """
-        from ..errors import ValidationError
-        # from ..debug import Debugger  # Removed
+        from .errors import ValidationError
         
         # Validate input is a tensor
         if not isinstance(tensor, torch.Tensor):
-            return Err(Error.Tensor.TypeCast(
-                f"Expected torch.Tensor, got {type(tensor).__name__}",
-                target_dtype=str(self.torch_dtype),
-                input_type=type(tensor).__name__
-            ))
-        
-        # Validate tensor is not empty
-        err = Debugger.validate_all(
-            Debugger.non_negative("tensor.numel()", torch.tensor([tensor.numel()]))
-        )
-        if err.is_err():
-            return Err(Error.Tensor.TypeCast(
-                f"Cannot cast empty tensor to {self.torch_dtype}",
-                target_dtype=str(self.torch_dtype),
-                tensor_shape=str(tuple(tensor.shape))
+            return Err(ValidationError(
+                message=f"Expected torch.Tensor, got {type(tensor).__name__}",
+                context={
+                    "target_dtype": str(self.torch_dtype),
+                    "input_type": type(tensor).__name__,
+                }
             ))
         
         # Attempt the cast
@@ -626,11 +616,13 @@ class _CastCallable:
             casted = tensor.to(self.torch_dtype)
             return Ok(casted)
         except Exception as e:
-            return Err(Error.Tensor.TypeCast(
-                f"Failed to cast tensor to {self.torch_dtype}: {e}",
-                target_dtype=str(self.torch_dtype),
-                source_dtype=str(tensor.dtype),
-                error=str(e)
+            return Err(ValidationError(
+                message=f"Failed to cast tensor from {tensor.dtype} to {self.torch_dtype}: {e}",
+                context={
+                    "target_dtype": str(self.torch_dtype),
+                    "source_dtype": str(tensor.dtype),
+                    "error": str(e),
+                }
             ))
     
     def __repr__(self) -> str:
@@ -647,7 +639,7 @@ class type_cast(metaclass=_CastMeta):
     Type-safe tensor casting with subscript syntax and Result-based error handling.
     
     Syntax:
-        type_cast[target_dtype](tensor)  # Returns Result[Tensor, Error]
+        type_cast[target_dtype](tensor)  # Returns Result[Tensor, ValidationError]
     
     Supports:
         - Custom dtype aliases: float32_t, int64_t, bool_t, etc.
@@ -655,27 +647,29 @@ class type_cast(metaclass=_CastMeta):
         - Python types: float, int, bool, complex (uses PyTorch defaults)
     
     Usage:
+        >>> from torchguard.typing import type_cast, float32_t
+        >>> 
         >>> # Returns Result for error handling
         >>> result = type_cast[float32_t](int_tensor)
-        >>> if result.is_err():
-        >>>     log_error(result)
-        >>>     return fallback
-        >>> casted = result.ok_value
+        >>> if result.is_ok():
+        >>>     casted = result.unwrap()
+        >>> else:
+        >>>     print(f"Cast failed: {result.unwrap_err()}")
         
         >>> # Python built-in types (PyTorch defaults)
-        >>> result = type_cast[float](int_tensor)    # → Result[torch.float32, Error]
-        >>> result = type_cast[int](float_tensor)    # → Result[torch.int64, Error]
-        >>> result = type_cast[bool](binary_tensor)  # → Result[torch.bool, Error]
+        >>> result = type_cast[float](int_tensor)    # → torch.float32
+        >>> result = type_cast[int](float_tensor)    # → torch.int64
+        >>> result = type_cast[bool](binary_tensor)  # → torch.bool
         
         >>> # PyTorch dtypes directly
         >>> result = type_cast[torch.float16](tensor)
         >>> result = type_cast[torch.bfloat16](tensor)
     
     Error Handling:
-        - Always returns Result[Tensor, Error]
+        - Always returns Result[Tensor, ValidationError]
         - On success: Ok(casted_tensor)
-        - On failure: Err(Error.Tensor.TypeCast(...))
-        - Validates input is a tensor and not empty
+        - On failure: Err(ValidationError(...))
+        - Validates input is a tensor
     
     Note:
         Python type mappings follow PyTorch conventions:
