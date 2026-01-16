@@ -5,6 +5,8 @@ Exports:
 - ErrorCode, ErrorDomain: Error classification
 - Severity: Error severity levels
 - ErrorConfig, AccumulationConfig: Configuration
+- CONFIG: Global mutable config object
+- get_config: Get the global config
 - ErrorLocation: Location registry (from location/)
 - Bit layout constants
 """
@@ -16,7 +18,9 @@ from .config import (
     Priority,
     Order,
     Dedupe,
-    DEFAULT_CONFIG,
+    CONFIG,
+    get_config,
+    set_config,
 )
 from .constants import (
     SLOT_BITS,
@@ -40,6 +44,7 @@ from .location import (
     extract_locations,
     location_from_stack,
 )
+from .device_cache import DeviceCache, get_device_cache
 
 __all__ = [
     # Codes
@@ -53,7 +58,9 @@ __all__ = [
     'Priority',
     'Order',
     'Dedupe',
-    'DEFAULT_CONFIG',
+    'CONFIG',
+    'get_config',
+    'set_config',
     # Constants
     'SLOT_BITS',
     'SLOTS_PER_WORD',
@@ -74,4 +81,7 @@ __all__ = [
     'LocationExtractor',
     'extract_locations',
     'location_from_stack',
+    # Device cache
+    'DeviceCache',
+    'get_device_cache',
 ]

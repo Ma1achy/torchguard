@@ -36,8 +36,8 @@ import torch
 from torch import Tensor
 
 from ..core.codes import ErrorCode
-from ..core.config import DEFAULT_CONFIG, ErrorConfig
-from ..core.constants import CODE_SHIFT, LOCATION_SHIFT, SLOT_BITS, SLOT_MASK, SLOTS_PER_WORD
+from ..core.config import ErrorConfig, get_config
+from ..core.constants import CODE_SHIFT, LOCATION_SHIFT, SLOT_BITS, SLOT_MASK
 from ..core.severity import Severity
 
 __all__ = ['ErrorFlags', 'UnpackedError']
@@ -105,7 +105,7 @@ class ErrorFlags:
     
     @classmethod
     @torch.compiler.disable
-    def unpack(cls, flags: Tensor, sample_idx: int = 0, config: ErrorConfig = DEFAULT_CONFIG) -> List[UnpackedError]:
+    def unpack(cls, flags: Tensor, sample_idx: int = 0, config: Optional[ErrorConfig] = None) -> List[UnpackedError]:
         """
         Unpack all errors for a single sample. Python boundary only.
         
@@ -114,7 +114,7 @@ class ErrorFlags:
             from the 16-bit packed format.
         
         Args:
-            flags (Tensor): Error flags tensor (N, num_words)
+            flags (Tensor): Error flags tensor (N, num_words) - int64, float32, or float64
             sample_idx (int): Sample index to unpack
             config (ErrorConfig): Error configuration
         
@@ -127,11 +127,25 @@ class ErrorFlags:
             ...     print(f"{err.code_name} @ {err.location_name}")
         """
         from ..core.location import ErrorLocation
+        from ..core.config import get_config
+        
+        cfg = config or get_config()
+        
+        # Convert float flags to int view for bitwise operations
+        if flags.dtype == torch.float32:
+            flags_int = flags.view(torch.int32)
+        elif flags.dtype == torch.float64:
+            flags_int = flags.view(torch.int64)
+        else:
+            flags_int = flags
+        
+        # Use config-based slots_per_word (2 for float32, 4 for float64/int64)
+        slots_per_word = cfg.slots_per_word
         
         errors: List[UnpackedError] = []
-        for w in range(config.num_words):
-            word_val = flags[sample_idx, w].item()
-            for s in range(SLOTS_PER_WORD):
+        for w in range(cfg.num_words):
+            word_val = int(flags_int[sample_idx, w].item())
+            for s in range(slots_per_word):
                 shift = s * SLOT_BITS
                 slot_val = (word_val >> shift) & SLOT_MASK
                 
@@ -152,9 +166,11 @@ class ErrorFlags:
     
     @classmethod
     @torch.compiler.disable
-    def unpack_all(cls, flags: Tensor, config: ErrorConfig = DEFAULT_CONFIG) -> List[List[UnpackedError]]:
+    def unpack_all(cls, flags: Tensor, config: Optional[ErrorConfig] = None) -> List[List[UnpackedError]]:
         """
         Unpack errors for all samples. Python boundary only.
+        
+        Uses vectorized extraction for better performance on large batches.
         
         Args:
             flags (Tensor): Error flags tensor (N, num_words)
@@ -169,7 +185,94 @@ class ErrorFlags:
             ...     if sample_errors:
             ...         print(f"Sample {i}: {len(sample_errors)} errors")
         """
-        return [cls.unpack(flags, i, config) for i in range(flags.shape[0])]
+        return cls.unpack_all_vectorized(flags, config)
+    
+    @classmethod
+    @torch.compiler.disable
+    def unpack_all_vectorized(cls, flags: Tensor, config: Optional[ErrorConfig] = None) -> List[List[UnpackedError]]:
+        """
+        Vectorized unpacking for all samples (optimized for large batches).
+        
+        Extracts all slot data using tensor operations before converting
+        to Python structures. Significantly faster than per-sample unpacking
+        for batches > 100 samples.
+        
+        Args:
+            flags (Tensor): Error flags tensor (N, num_words)
+            config (ErrorConfig): Error configuration
+        
+        Returns:
+            (List[List[UnpackedError]]): List of unpacked errors per sample
+        """
+        from ..core.location import ErrorLocation
+        
+        cfg = config or get_config()
+        batch_size, num_words = flags.shape
+        slots_per_word = cfg.slots_per_word
+        total_slots = num_words * slots_per_word
+        
+        # Convert float flags to int view for bitwise operations
+        if flags.dtype == torch.float32:
+            flags_int = flags.view(torch.int32)
+        elif flags.dtype == torch.float64:
+            flags_int = flags.view(torch.int64)
+        else:
+            flags_int = flags
+        
+        # Create shift values for all slots: [0, 16, 32, 48, 0, 16, 32, 48, ...]
+        slot_shifts = torch.arange(slots_per_word, device=flags.device, dtype=flags_int.dtype) * SLOT_BITS
+        
+        # Extract all slots at once
+        # flags_int: (batch_size, num_words)
+        # slot_shifts: (slots_per_word,)
+        # Result: (batch_size, num_words, slots_per_word) -> (batch_size, total_slots)
+        words_expanded = flags_int.unsqueeze(-1)  # (batch_size, num_words, 1)
+        all_slots = (words_expanded >> slot_shifts) & SLOT_MASK  # (batch_size, num_words, slots_per_word)
+        all_slots = all_slots.view(batch_size, total_slots)  # (batch_size, total_slots)
+        
+        # Vectorized extraction of error components
+        severities = (all_slots & 0x3).to(torch.int32)  # (batch_size, total_slots)
+        codes = ((all_slots >> CODE_SHIFT) & 0xF).to(torch.int32)
+        locations = ((all_slots >> LOCATION_SHIFT) & 0x3FF).to(torch.int32)
+        
+        # Filter non-empty slots (severity != OK)
+        non_empty = severities != Severity.OK  # (batch_size, total_slots)
+        
+        # Convert to Python list structure
+        result: List[List[UnpackedError]] = []
+        
+        # Move to CPU for faster Python iteration
+        severities_cpu = severities.cpu()
+        codes_cpu = codes.cpu()
+        locations_cpu = locations.cpu()
+        non_empty_cpu = non_empty.cpu()
+        
+        for i in range(batch_size):
+            mask_i = non_empty_cpu[i]
+            sample_errors: List[UnpackedError] = []
+            
+            if mask_i.any():
+                # Get indices where mask is True
+                indices = mask_i.nonzero(as_tuple=True)[0]
+                
+                for idx in indices:
+                    idx_int = idx.item()
+                    sev = severities_cpu[i, idx_int].item()
+                    code = codes_cpu[i, idx_int].item()
+                    loc = locations_cpu[i, idx_int].item()
+                    
+                    sample_errors.append(UnpackedError(
+                        severity=sev,
+                        code=code,
+                        location=loc,
+                        severity_name=Severity.name(sev),
+                        code_name=ErrorCode.name(code),
+                        location_name=ErrorLocation.name(loc),
+                    ))
+            
+            result.append(sample_errors)
+        
+        return result
     
     # ═══════════════════════════════════════════════════════════════════════════
     # SUMMARY/DEBUG (Python boundary only)
@@ -177,7 +280,7 @@ class ErrorFlags:
     
     @classmethod
     @torch.compiler.disable
-    def summary(cls, flags: Tensor, config: ErrorConfig = DEFAULT_CONFIG) -> Dict[str, Dict[str, int]]:
+    def summary(cls, flags: Tensor, config: Optional[ErrorConfig] = None) -> Dict[str, Dict[str, int]]:
         """
         Aggregate error counts by location and code.
         
@@ -198,7 +301,7 @@ class ErrorFlags:
         n = flags.shape[0]
         
         for i in range(n):
-            for err in cls.unpack(flags, i, config):
+            for err in cls.unpack(flags, i, config or get_config()):
                 if err.code == ErrorCode.OK:
                     continue
                 
@@ -213,7 +316,7 @@ class ErrorFlags:
     
     @classmethod
     @torch.compiler.disable
-    def repr(cls, flags: Tensor, config: ErrorConfig = DEFAULT_CONFIG) -> str:
+    def repr(cls, flags: Tensor, config: Optional[ErrorConfig] = None) -> str:
         """
         Pretty string representation of flags tensor.
         
@@ -233,12 +336,12 @@ class ErrorFlags:
         from ..err import err
         
         n = flags.shape[0]
-        total_errors = int(err.count_errors(flags, config).sum().item())
+        total_errors = int(err.count_errors(flags, config or get_config()).sum().item())
         
         if total_errors == 0:
             return f"ErrorFlags({n} samples, no errors)"
         
-        summary = cls.summary(flags, config)
+        summary = cls.summary(flags, config or get_config())
         
         code_counts: Dict[str, int] = {}
         loc_set: set = set()
@@ -258,7 +361,7 @@ class ErrorFlags:
     
     @classmethod
     @torch.compiler.disable
-    def pretty_print(cls, flags: Tensor, sample_idx: int = 0, config: ErrorConfig = DEFAULT_CONFIG) -> str:
+    def pretty_print(cls, flags: Tensor, sample_idx: int = 0, config: Optional[ErrorConfig] = None) -> str:
         """
         Pretty print errors for debugging. Python boundary only.
         
@@ -276,7 +379,7 @@ class ErrorFlags:
             >>> #   [0] ERROR | NUMERIC.NAN | @ customer_encoder
             >>> #   [1] WARN | INDEX.OUT_OF_BOUNDS | @ hash_helpers
         """
-        errors = cls.unpack(flags, sample_idx, config)
+        errors = cls.unpack(flags, sample_idx, config or get_config())
         if not errors:
             return "[OK] No errors"
         

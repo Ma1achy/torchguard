@@ -65,9 +65,45 @@ def __warn_once(key: tuple, msg: str) -> None:
 # ERROR_T VALIDATION HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Valid dtypes for error flags (from global config)
+_VALID_ERROR_T_DTYPES = {torch.int64, torch.float32, torch.float64, torch.int32}
+
+
+def __is_valid_error_t_dtype(dtype: torch.dtype) -> bool:
+    """Check if dtype is valid for error_t."""
+    return dtype in _VALID_ERROR_T_DTYPES
+
+
+def __looks_like_error_flags(tensor: Any) -> bool:
+    """
+    Check if a tensor looks like error flags based on global CONFIG.
+    
+    Matches against the global config's dtype and num_words:
+    - Must be a tensor with valid error_t dtype
+    - Must be 2D with shape (batch, num_words)
+    - Must match global CONFIG.flag_dtype and CONFIG.num_words
+    
+    This ensures auto-detection respects the user's config settings.
+    """
+    if not hasattr(tensor, 'dtype') or not hasattr(tensor, 'ndim'):
+        return False
+    
+    if tensor.ndim != 2:
+        return False
+    
+    from .core.config import get_config
+    config = get_config()
+    
+    # Check if dtype and num_words match global config
+    return (tensor.dtype == config.flag_dtype and 
+            tensor.shape[1] == config.num_words)
+
+
 def __validate_error_t(maybe_flags: Any, strict: bool = False) -> None:
     """
-    Validate tensor looks like a valid error_t.
+    Validate tensor looks like a valid error_t based on global CONFIG.
+    
+    Checks against CONFIG.flag_dtype and CONFIG.num_words.
     
     Args:
         maybe_flags: Value to check
@@ -76,8 +112,11 @@ def __validate_error_t(maybe_flags: Any, strict: bool = False) -> None:
     if not hasattr(maybe_flags, 'dtype'):
         return  # Not a tensor
     
-    if maybe_flags.dtype != torch.int64:
-        msg = f"error_t should be int64, got {maybe_flags.dtype}"
+    from .core.config import get_config
+    config = get_config()
+    
+    if not __is_valid_error_t_dtype(maybe_flags.dtype):
+        msg = f"error_t should be a valid flag dtype, got {maybe_flags.dtype}. Current CONFIG.flag_dtype is {config.flag_dtype}"
         if strict:
             raise TypeError(msg)
         else:
@@ -101,7 +140,10 @@ def __extract_and_inject_locations(module: nn.Module) -> None:
     
     Warns if any submodules can't receive _fx_path (e.g., frozen modules).
     """
-    from .core.location import ErrorLocation
+    # Use absolute import to ensure we get the same ErrorLocation class
+    # that users import from torchguard
+    import torchguard
+    ErrorLocation = torchguard.ErrorLocation
     
     failed_injections: list[str] = []
     
@@ -395,9 +437,9 @@ def __create_wrapper(func: Callable, sig: inspect.Signature, func_name: str, res
         if detect_codes and isinstance(result, tuple) and len(result) >= 2:
             *outputs, flags = result
             
-            # Only process if flags looks like error_t (int64, 2D)
-            if (hasattr(flags, 'dtype') and flags.dtype == torch.int64 
-                and hasattr(flags, 'ndim') and flags.ndim == 2):
+            # Only process if flags looks like error_t
+            # Supports both stable (int64) and experimental (float32/float64) backends
+            if __looks_like_error_flags(flags):
                 flags = __auto_detect_errors(tuple(outputs), flags, module, detect_codes)
                 result = (*outputs, flags)
         

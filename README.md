@@ -13,7 +13,7 @@ NaN/Inf values can propagate through compiled graphs, but most real training/inf
 * Per-sample error tracking inside compiled graphs (no graph breaks)
 * One bad token does not mean drop 32 examples
 * Exact location of every NaN/Inf/OOB, even in nested submodules
-* Compiled-safe conditional recovery (`torch.cond`-based DSL)
+* Compiled-safe conditional recovery (`torch.where`-based DSL)
 
 ```python
 output, f = model(x)          # works with torch.compile(fullgraph=True)
@@ -36,13 +36,13 @@ if has_err(f):
 * [Configuration](#configuration)
 * [Performance](#performance-benchmarks)
 * [When NOT to Use](#when-not-to-use-torchguard)
-* [Experimental Backend](#experimental-backend-float64view)
+* [Experimental Backend](#experimental-backend)
 
 ### At a glance
 
 - **Works with `torch.compile(fullgraph=True)`**: per-sample error tracking without graph breaks
 - **Bit-packed flags**: error slots stored in a compact `(batch, num_words)` flags tensor
-- **Optional control-flow DSL**: `torch.cond`-powered `IF`/`ELIF`/`ELSE` for recovery inside compiled graphs
+- **Optional control-flow DSL**: `torch.where`-based `IF`/`ELIF`/`ELSE` for recovery inside compiled graphs
 - **Configurable accumulation**: FIFO/LIFO, severity-based policies, and deduplication options
 
 ---
@@ -95,7 +95,7 @@ TorchGuard does not prevent floating-point NaNs from existing; it prevents contr
 > * **Stable (default):** `from torchguard import err, flags, ...`
 >   — `int64` bitpacking, best for eager or light compile usage.
 > * **Experimental (compile-focused):** `from torchguard.experimental import err, IF, IS, ...`
->   — `float64` storage + `view(int64)` hack, best for `torch.compile(fullgraph=True)` training and control flow DSL.
+>   — `float32` storage (configurable), best for `torch.compile(fullgraph=True)` training with `inductor` backend.
 
 ---
 
@@ -112,7 +112,7 @@ If you only read one section after Quick Start, read **Common Patterns**.
 ```python
 import torch
 import torch.nn as nn
-from torchguard import err, flags, has_err, flag_nan, tracked
+from torchguard import err, flags, has_err, flag_nan, flag_nan_and_inf, tracked
 
 @tracked                              # enables location names
 class MyModel(nn.Module):
@@ -131,8 +131,8 @@ class MyModel(nn.Module):
 
 model = torch.compile(MyModel(), fullgraph=True)
 out, f = model(torch.randn(32, 512))
-# f: flags tensor, shape (batch, num_words), dtype int64
-#     (or float64 carrier if you opt into the experimental backend for `torch.compile(fullgraph=True)` training)
+# f: flags tensor, shape (batch, num_words), dtype int64 (default)
+#     Change backend via tg.CONFIG.flag_dtype = torch.float32 for experimental backend
 
 if has_err(f):
     print(flags.repr(f))
@@ -204,8 +204,8 @@ z, f = (
 ### Terminology
 
 * **Sample** – One row in the leading batch dimension
-* **Flags tensor** – Shape `(batch, num_words)`, dtype `int64`. Each sample gets its own error slots (or `float64` when using the [experimental backend](#experimental-backend-float64view); the bit layout is identical)
-* **`error_t`** – A type alias used in annotations for an `int64` tensor of shape `(batch, num_words)` (or `float64` carrier with identical bit layout when using the experimental backend)
+* **Flags tensor** – Shape `(batch, num_words)`, dtype `int64`. Each sample gets its own error slots (or float32/float64 when using the [experimental backend](#experimental-backend); the bit layout is identical)
+* **`error_t`** – A type alias used in annotations for an `int64` tensor of shape `(batch, num_words)` (or float carrier with identical bit layout when using the experimental backend)
 
 ### Flags Tensor Layout
 
@@ -241,7 +241,30 @@ Each error is packed into a 16-bit slot. Four slots fit into one 64-bit word:
 * Any word non-zero = at least one error
 * Use `err.is_ok(f)` / `has_err(f)` rather than comparing directly
 
-### Error Codes
+### Error Codes and Domains
+
+Error codes are organized into **domains** for quick filtering. Each 4-bit code contains a 2-bit domain and 2-bit subcode.
+
+**Error Domains:**
+
+| Domain      | Value | Description                       | Query with              |
+| ----------- | ----- | --------------------------------- | ----------------------- |
+| `NUMERIC`   | 0     | Numerical issues (NaN, Inf)       | `err.has_domain(f, 0)`  |
+| `INDEX`     | 1     | Indexing issues (OOB, negative)   | `err.has_domain(f, 1)`  |
+| `QUALITY`   | 2     | Output quality (zero, constant)   | `err.has_domain(f, 2)`  |
+| `RUNTIME`   | 3     | Runtime recovery (fallback, clamp)| `err.has_domain(f, 3)`  |
+
+```python
+from torchguard import ErrorDomain
+
+# Check if any sample has numeric errors (NaN, Inf, or Overflow)
+numeric_mask = err.has_domain(flags, ErrorDomain.NUMERIC)
+
+# Check for any runtime recovery operations
+runtime_mask = err.has_domain(flags, ErrorDomain.RUNTIME)
+```
+
+**Error Codes:**
 
 | Domain      | Code                    | Value | Description           | Used by                    |
 | ----------- | ----------------------- | ----- | --------------------- | -------------------------- |
@@ -314,18 +337,20 @@ err.OK        # 0
 
 ### Querying Methods
 
-| Method                  | Returns      | Description                           |
-| ----------------------- | ------------ | ------------------------------------- |
-| `err.is_ok(f)`          | `(N,) bool`  | `True` where sample has **no** errors |
-| `err.is_err(f)`         | `(N,) bool`  | `True` where sample **has** errors    |
-| `err.all_ok(f)`         | `() bool`    | Scalar: all samples OK?               |
-| `err.any_err(f)`        | `() bool`    | Scalar: any errors?                   |
-| `err.has_nan(f)`        | `(N,) bool`  | Per-sample NaN check                  |
-| `err.has_inf(f)`        | `(N,) bool`  | Per-sample Inf check                  |
-| `err.has_code(f, code)` | `(N,) bool`  | Per-sample code check                 |
-| `err.has_critical(f)`   | `(N,) bool`  | Per-sample critical check             |
-| `err.count_errors(f)`   | `(N,) int32` | Error count per sample                |
-| `err.max_severity(f)`   | `(N,) int64` | Max severity per sample               |
+| Method                    | Returns      | Description                              |
+| ------------------------- | ------------ | ---------------------------------------- |
+| `err.is_ok(f)`            | `(N,) bool`  | `True` where sample has **no** errors    |
+| `err.is_err(f)`           | `(N,) bool`  | `True` where sample **has** errors       |
+| `err.all_ok(f)`           | `() bool`    | Scalar: all samples OK?                  |
+| `err.any_err(f)`          | `() bool`    | Scalar: any errors?                      |
+| `err.has_nan(f)`          | `(N,) bool`  | Per-sample NaN check                     |
+| `err.has_inf(f)`          | `(N,) bool`  | Per-sample Inf check                     |
+| `err.has_code(f, code)`   | `(N,) bool`  | Per-sample code check                    |
+| `err.has_critical(f)`     | `(N,) bool`  | Per-sample critical check                |
+| `err.has_domain(f, dom)`  | `(N,) bool`  | Per-sample domain check (NUMERIC, etc.)  |
+| `err.has_fallback(f)`     | `(N,) bool`  | Per-sample check for fallback values     |
+| `err.count_errors(f)`     | `(N,) int32` | Error count per sample                   |
+| `err.max_severity(f)`     | `(N,) int64` | Max severity per sample                  |
 
 ### Filtering Methods
 
@@ -436,8 +461,16 @@ These functions return Python values and will introduce graph breaks if used ins
 | Method                        | Description                         |
 | ----------------------------- | ----------------------------------- |
 | `flags.unpack(f, sample_idx)` | Unpack errors for one sample        |
+| `flags.unpack_all(f)`         | Unpack errors for all samples (vectorized) |
 | `flags.repr(f)`               | Pretty string representation        |
 | `flags.summary(f)`            | Dict of `{location: {code: count}}` |
+
+**Classes:**
+
+| Class | Description |
+| ----- | ----------- |
+| `ErrorFlags` | Static methods for flag inspection |
+| `UnpackedError` | NamedTuple with `severity`, `code`, `location`, `*_name` fields |
 
 ```python
 if has_err(f):
@@ -469,6 +502,7 @@ All helper functions are implemented in terms of the `err` namespace. Detection/
 | `fix(z, f, module, fallback=0.0)`                  | Replace bad values, record `FALLBACK_VALUE`       |
 | `flag_nan(z, module, f)`                           | Detect NaN and record                             |
 | `flag_inf(z, module, f)`                           | Detect Inf and record                             |
+| `flag_nan_and_inf(z, module, f)`                   | **Fused** NaN+Inf detection (faster than separate calls) |
 | `flag_oob_indices(ids, num_embeddings, module, f)` | Check index bounds                                |
 
 ```python
@@ -504,6 +538,7 @@ Applicative/monadic-style combinators, all `torch.compile(fullgraph=True)` compa
 | ----------------------- | ---------------------------------------- |
 | `err.map_ok(f, z, fn)`  | Apply `fn` to `z` for OK samples only    |
 | `err.map_err(f, z, fn)` | Apply `fn` to `z` for error samples only |
+| `err.replace(t, value, targets)` | Replace NaN/Inf/specific values in tensor |
 
 ```python
 # Normalise only clean samples
@@ -511,14 +546,33 @@ h = err.map_ok(f, h, lambda z: z / z.norm(dim=-1, keepdim=True))
 
 # Zero out error samples
 h = err.map_err(f, h, lambda z: torch.zeros_like(z))
+
+# Replace NaN and Inf with 0.0 (gradient-safe)
+h = err.replace(h, value=0.0, targets=[err.NAN, err.INF])
+
+# Replace only NaN
+h = err.replace(h, value=0.0, targets=[err.NAN])
+
+# Replace specific numerical values
+h = err.replace(h, value=-1.0, targets=[999, float('inf')])
 ```
 
 ### Chaining
 
-| Method                   | Description                                |
-| ------------------------ | ------------------------------------------ |
-| `err.and_then(f, z, fn)` | Short-circuit: skip `fn` for error samples |
-| `err.bind(f, z, fn)`     | Accumulate: run `fn`, collect ALL errors   |
+| Method                    | Description                                |
+| ------------------------- | ------------------------------------------ |
+| `err.and_then(f, z, fn)`  | Short-circuit: skip `fn` for error samples |
+| `err.bind(f, z, fn)`      | Accumulate: run `fn`, collect ALL errors   |
+| `err.map_err_flags(f, fn)`| Apply `fn` to flags of error samples       |
+
+```python
+# Apply transformation only to flags of error samples
+def add_context(flags):
+    # Add additional error context
+    return err.push(flags, err.SATURATED, location=99, severity=err.WARN)
+
+updated_flags = err.map_err_flags(flags, add_context)
+```
 
 ### Guards and Recovery
 
@@ -533,7 +587,7 @@ h = err.map_err(f, h, lambda z: torch.zeros_like(z))
 <details>
 <summary><strong>Control Flow DSL (Advanced)</strong></summary>
 
-Conditional logic inside compiled code using `torch.cond` internally.
+Conditional logic inside compiled code using `torch.where` for selection.
 
 **Note:** For use with `torch.compile(fullgraph=True)`, import from the experimental backend:
 
@@ -541,13 +595,13 @@ Conditional logic inside compiled code using `torch.cond` internally.
 from torchguard.experimental import err, IF, IS, HAS, AND, OR, NOT
 ```
 
-See [Experimental Backend](#experimental-backend-float64view) for details.
+See [Experimental Backend](#experimental-backend) for details.
 
 **Important constraints:**
-* `torch.cond` requires both branches to be traceable
-* No short-circuit evaluation - all branch conditions are evaluated (required by `torch.cond`)
+* All branches are evaluated (no short-circuit) - this ensures proper gradient flow
 * Keep branch bodies **side-effect free** (no logging, no mutation of Python objects, no graph breaks)
 * Branch outputs must be **shape-consistent** across all paths
+* In eager mode, uses Python control flow; in compiled mode, uses `torch.where` selection
 
 ### Predicates
 
@@ -589,7 +643,7 @@ z, f = (
 <details>
 <summary><strong>Auto-Detection (<code>@tensorcheck</code>, Advanced)</strong></summary>
 
-Automatic NaN/Inf detection on method return values:
+Automatic NaN/Inf detection on method return values. Works with both stable (`int64`) and experimental (`float32`/`float64`) backends:
 
 ```python
 from torchguard import tracked, tensorcheck, err
@@ -610,6 +664,19 @@ class SafeModel(nn.Module):
     @tensorcheck(auto_detect=False)  # Validation only, no detection
     def forward_no_detect(self, x):
         ...
+```
+
+```python
+# Also works with experimental float32 backend
+from torchguard.experimental import err as exp_err
+
+@tracked
+class ExperimentalModel(nn.Module):
+    @tensorcheck
+    def forward(self, x):
+        f = exp_err.new(x)  # float32 flags
+        out = self.layer(x)
+        return out, f  # Auto-detection works!
 ```
 
 </details>
@@ -783,47 +850,279 @@ Validates tensor shapes and dtypes at runtime (skipped during `torch.compile`):
 @tensorcheck(auto_detect={err.NAN})   # Only detect NaN
 ```
 
+**Backend support:** Auto-detection works with both stable (`int64`) and experimental (`float32`/`float64`) backends. The decorator automatically recognizes flag tensors based on their dtype and shape.
+
+### Validation Errors
+
+When `@tensorcheck` detects validation failures, it raises specific exception types:
+
+```python
+from torchguard import (
+    ValidationError,          # Base class for all validation errors
+    DimensionMismatchError,   # Shape mismatch
+    DTypeMismatchError,       # Dtype mismatch
+    DeviceMismatchError,      # Device mismatch (CPU vs GPU)
+    InvalidParameterError,    # Parameter validation failed
+    TypeMismatchError,        # Return type mismatch
+    InvalidReturnTypeError,   # Invalid return value
+)
+
+try:
+    output, flags = model(x)
+except DimensionMismatchError as e:
+    print(f"Shape validation failed: {e}")
+except DTypeMismatchError as e:
+    print(f"Dtype validation failed: {e}")
+```
+
+These exceptions are only raised at runtime (not during `torch.compile`).
+
+</details>
+
+<details>
+<summary><strong>Result-Oriented Programming</strong></summary>
+
+TorchGuard includes decorators for exception-free programming with `Result` types:
+
+```python
+from torchguard import as_result, as_exception, unwrap, Ok, Err, Result
+
+@as_result
+def might_fail(x):
+    """Returns Result[T, Exception] instead of raising."""
+    if x < 0:
+        raise ValueError("Negative input")
+    return x * 2
+
+result = might_fail(-5)
+if result.is_err():
+    print(f"Failed: {result.unwrap_err()}")
+else:
+    print(f"Success: {result.unwrap()}")
+```
+
+**Decorators:**
+
+| Decorator        | Behavior                                          |
+| ---------------- | ------------------------------------------------- |
+| `@as_result`     | Catches exceptions, returns `Result[T, Exception]`|
+| `@as_exception`  | Unwraps `Result`, raises on `Err`                 |
+| `@unwrap`        | Unwraps `Result`, raises on `Err` (alias)         |
+
+```python
+@as_result
+def safe_divide(a, b):
+    if b == 0:
+        raise ZeroDivisionError("Division by zero")
+    return a / b
+
+# Returns Result[float, ZeroDivisionError]
+result = safe_divide(10, 0)
+assert result.is_err()
+
+# Chain results
+def process(x):
+    result = safe_divide(x, 2)
+    if result.is_err():
+        return result  # Propagate error
+    return Ok(result.unwrap() + 1)
+```
+
+**Result API:**
+
+| Method          | Description                       |
+| --------------- | --------------------------------- |
+| `is_ok()`       | Check if result is Ok             |
+| `is_err()`      | Check if result is Err            |
+| `unwrap()`      | Get value or raise                |
+| `unwrap_err()`  | Get error or raise                |
+| `unwrap_or(d)`  | Get value or default              |
+| `map(fn)`       | Transform Ok value                |
+| `map_err(fn)`   | Transform Err value               |
+
+</details>
+
 ---
 
 ## Configuration
 
-<details>
-<summary><strong>Details</strong></summary>
+TorchGuard uses a **global mutable config** that controls behavior for all operations:
+
+### Global Config
 
 ```python
-from torchguard import err, ErrorConfig, AccumulationConfig, Priority, Order, Dedupe, Severity
+import torch
+import torchguard as tg
 
-config = ErrorConfig(
-    num_slots=16,                         # Max errors per sample (default: 16)
-    accumulation=AccumulationConfig(),    # Accumulation policy
-    default_severity=Severity.ERROR,
-)
+# Access the global config
+print(tg.CONFIG.flag_dtype)  # torch.int64 (default)
+print(tg.CONFIG.num_slots)   # 16 (default)
+
+# Modify config directly
+tg.CONFIG.flag_dtype = torch.float32  # Switch to experimental backend
+tg.CONFIG.num_slots = 32              # More error slots per sample
+
+# All operations automatically use the new config
+x = torch.randn(4, 8)
+flags = tg.err.new(x)  # Creates float32 flags with 32 slots
+
+# Or replace the entire config at once
+from torchguard import set_config, ErrorConfig, get_config
+
+original = get_config()
+set_config(ErrorConfig(flag_dtype=torch.float32, num_slots=64))
+try:
+    # ... use new config ...
+finally:
+    set_config(original)  # Restore
 ```
 
-### Where This Plugs In
+### Config Properties
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `flag_dtype` | `torch.dtype` | `torch.int64` | Storage dtype: `float32`/`float64` (experimental) or `int32`/`int64` (stable) |
+| `num_slots` | `int` | `16` | Max errors per sample (1-32768, fully vectorized) |
+| `accumulation` | `AccumulationConfig` | FIFO | How to handle slot overflow (see below) |
+| `default_severity` | `Severity` | `ERROR` | Default severity for `push` operations |
+| `strict_validation` | `bool` | `False` | Raise vs warn on validation failures |
+| `use_transposed_layout` | `bool` | `False` | Use transposed memory layout for large batches |
+| `transpose_threshold` | `int` | `10000` | Batch size above which transposition is applied |
+
+### Backend Selection via flag_dtype
 
 ```python
-# Pass config when creating a flags tensor
-f = err.new_t(n=batch_size, device=x.device, config=config)
+# Stable backend (int64) - default, best for inference/eager mode
+tg.CONFIG.flag_dtype = torch.int64
+
+# Experimental backend (float32) - best for torch.compile(fullgraph=True) training
+tg.CONFIG.flag_dtype = torch.float32
+
+# Experimental backend (float64) - more slots per word (4 vs 2 for float32)
+tg.CONFIG.flag_dtype = torch.float64
+```
+
+### Per-Operation Config Override
+
+```python
+# Use global config by default
+flags = tg.err.new(x)  # Uses tg.CONFIG
+
+# Override for specific operations
+custom = tg.ErrorConfig(flag_dtype=torch.float64, num_slots=8)
+flags = tg.err.new_t(5, config=custom)  # Uses custom config
 ```
 
 ### Accumulation Policies
 
-| Axis       | Values                               | Description                      |
-| ---------- | ------------------------------------ | -------------------------------- |
-| `Priority` | `CHRONO`, `SEVERITY`, `LOCATION`     | What determines importance       |
-| `Order`    | `FIRST`, `LAST`                      | Keep min or max on priority axis |
-| `Dedupe`   | `NONE`, `CODE`, `LOCATION`, `UNIQUE` | How to group duplicates          |
+When error slots fill up (e.g., NaN propagates through 20 layers but you only have 16 slots), the accumulation policy decides which errors to keep:
+
+<details>
+<summary><strong>Policy Details</strong></summary>
 
 ```python
-# LIFO (default) – keep newest errors
-AccumulationConfig(priority=Priority.CHRONO, order=Order.LAST)
+from torchguard import AccumulationConfig, Priority, Order, Dedupe
 
-# FIFO – root cause preservation
-AccumulationConfig(priority=Priority.CHRONO, order=Order.FIRST)
+# Modify global config's accumulation
+tg.CONFIG.accumulation = AccumulationConfig(
+    priority=Priority.CHRONO,  # What determines importance
+    order=Order.FIRST,         # Keep FIRST or LAST on priority axis
+    dedupe=Dedupe.UNIQUE       # Deduplication strategy
+)
+```
 
-# Severity-based – keep highest severity
-AccumulationConfig(priority=Priority.SEVERITY, order=Order.LAST)
+**Three orthogonal axes:**
+
+| Axis | Values | Description |
+|------|--------|-------------|
+| `Priority` | `CHRONO`, `SEVERITY`, `LOCATION` | What determines importance |
+| `Order` | `FIRST`, `LAST` | Keep min or max on priority axis |
+| `Dedupe` | `NONE`, `CODE`, `LOCATION`, `UNIQUE` | How to group duplicates |
+
+**Common configurations:**
+
+```python
+# FIFO (default) – keep oldest errors for root cause debugging
+AccumulationConfig(priority=Priority.CHRONO, order=Order.FIRST, dedupe=Dedupe.UNIQUE)
+
+# LIFO – keep newest errors to track most recent state
+AccumulationConfig(priority=Priority.CHRONO, order=Order.LAST, dedupe=Dedupe.UNIQUE)
+
+# Severity-based – keep highest severity errors
+AccumulationConfig(priority=Priority.SEVERITY, order=Order.LAST, dedupe=Dedupe.UNIQUE)
+```
+
+**Example: Why FIFO is default**
+
+```python
+# Scenario: NaN originates in layer 1, propagates through 20 layers
+
+# With FIFO (default - Order.FIRST):
+# Slots 1-16 record layers 1-16
+# Layer 1's error is preserved ✅
+# You can see where the NaN originated
+
+# With LIFO (Order.LAST):
+# Slots 1-16 record layers 5-20
+# Layer 1's error gets dropped ❌
+# You only see propagation, not the root cause
+```
+
+**When to change:**
+
+- **Keep FIFO** for debugging NaN/Inf issues (find where it starts)
+- **Use LIFO** for monitoring production systems (track recent state)
+- **Use SEVERITY** for production error handling (prioritize critical issues)
+
+</details>
+
+---
+
+## Advanced Topics
+
+<details>
+<summary><strong>Bit-Level Constants (Advanced)</strong></summary>
+
+For advanced users who need to inspect or manipulate flag tensors directly, TorchGuard exports bit-level constants:
+
+```python
+from torchguard import (
+    SLOT_BITS,        # 16 - bits per slot
+    SLOTS_PER_WORD,   # 4 - slots per 64-bit word (int64/float64)
+    SEVERITY_SHIFT,   # 0 - bit offset for severity
+    SEVERITY_BITS,    # 2 - bits for severity
+    SEVERITY_MASK,    # 0x3 - mask for severity
+    CODE_SHIFT,       # 2 - bit offset for code
+    CODE_BITS,        # 4 - bits for code
+    CODE_MASK,        # 0xF - mask for code
+    LOCATION_SHIFT,   # 6 - bit offset for location
+    LOCATION_BITS,    # 10 - bits for location
+    LOCATION_MASK,    # 0x3FF - mask for location
+    SLOT_MASK,        # 0xFFFF - mask for entire slot
+)
+
+# Extract components from a packed slot manually
+def unpack_slot(slot_value):
+    severity = (slot_value >> SEVERITY_SHIFT) & SEVERITY_MASK
+    code = (slot_value >> CODE_SHIFT) & CODE_MASK
+    location = (slot_value >> LOCATION_SHIFT) & LOCATION_MASK
+    return severity, code, location
+```
+
+**Warning:** Direct bit manipulation is rarely needed. Use `err.*` and `flags.*` APIs instead. These constants are primarily for:
+- Debugging TorchGuard itself
+- Implementing custom backends
+- Performance-critical custom operations
+
+**Slot layout:**
+
+```
+16-bit slot:
+┌─────────────┬──────────┬──────────┐
+│ Location    │ Code     │ Severity │
+│ 10 bits     │ 4 bits   │ 2 bits   │
+│ bits 15-6   │ bits 5-2 │ bits 1-0 │
+└─────────────┴──────────┴──────────┘
 ```
 
 </details>
@@ -866,6 +1165,72 @@ AccumulationConfig(priority=Priority.SEVERITY, order=Order.LAST)
 
 </details>
 
+<details>
+<summary><strong>Performance Optimizations</strong></summary>
+
+TorchGuard includes several optimizations for high-performance workloads:
+
+### Device-Aware Tensor Caching
+
+TorchGuard automatically caches frequently-used tensors (shift arrays, constants) per device to avoid redundant allocations in hot paths:
+
+```python
+# These operations reuse cached tensors internally:
+flags = err.new(x)  # Reuses cached slot shift tensors
+flags = err.push(flags, code, loc)  # Reuses cached constants
+```
+
+The cache is:
+- **Thread-safe**: Safe for multi-threaded usage
+- **torch.compile-compatible**: Marked with `@torch._dynamo.disable` to prevent tracing issues
+- **Device-aware**: Maintains separate caches for CPU, CUDA, MPS, etc.
+- **Memory-efficient**: ~1-2KB per device
+
+### Fused Operations
+
+Use `flag_nan_and_inf()` instead of separate `flag_nan()` + `flag_inf()` calls:
+
+```python
+# Before: Two separate passes
+f = flag_nan(out, self.layer, f)
+f = flag_inf(out, self.layer, f)
+
+# After: Single fused pass (~30% faster)
+f = flag_nan_and_inf(out, self.layer, f)
+```
+
+### Vectorized Unpacking
+
+For large batches, `flags.unpack_all(f)` uses vectorized extraction:
+
+```python
+# Automatically uses vectorized implementation
+all_errors = flags.unpack_all(f)  # List[List[UnpackedError]] for all samples
+```
+
+Benefits:
+- Batch-level tensor operations instead of per-sample Python loops
+- Significant speedup for batches > 100 samples
+
+### Memory Layout Optimization (Advanced)
+
+For very large batches (10,000+ samples), TorchGuard supports an optional transposed memory layout for better cache locality:
+
+```python
+import torchguard as tg
+
+# Enable transposed layout for large batches
+tg.CONFIG.use_transposed_layout = True
+tg.CONFIG.transpose_threshold = 10000  # Only transpose batches > 10k
+
+# Check if transposition will be used
+will_transpose = tg.CONFIG.should_transpose(batch_size=15000)  # True
+```
+
+**When to use:** Only for very large batches where profiling shows memory bandwidth is a bottleneck. For most workloads, the default layout is optimal.
+
+</details>
+
 ---
 
 ## When NOT to Use TorchGuard
@@ -885,7 +1250,7 @@ TorchGuard does not aim to:
 
 ---
 
-## Experimental Backend (float64+view)
+## Experimental Backend
 
 TorchGuard includes an **experimental backend** designed for full `torch.compile(fullgraph=True)` compatibility, including training with gradients.
 
@@ -894,39 +1259,55 @@ TorchGuard includes an **experimental backend** designed for full `torch.compile
 The stable backend stores flags as `int64` tensors. Some `torch.compile` / AOTAutograd setups are sensitive to additional non-differentiable outputs, particularly:
 
 1. **AOTAutograd wrapper constraints around aliasing/mutation/view reconstruction** – the runtime wrapper logic can be sensitive to extra outputs, especially when those outputs have complex view/alias relationships
-2. **`torch.cond` aliasing constraints** – returning `int64` flags directly from `torch.cond` branches can trigger aliasing errors during higher-order op tracing in some configurations
+2. **Inductor backward pass constraints** – certain configurations can cause issues during gradient computation
 
 These issues don't affect all users, but they can manifest as:
 * Errors about view operations during backward pass setup
-* Failures when using control flow (`torch.cond`) with flag outputs
-* Issues with certain compiler backend configurations
+* Issues with certain compiler backend configurations (especially `inductor`)
 
 ### The Solution
 
-The experimental backend stores flags as **`float64` tensors** but uses `view(torch.int64)` for all bitwise operations:
+The experimental backend stores flags as **float tensors** (float32 by default, float64 optional) but uses `view()` to the corresponding int type for all bitwise operations:
 
 ```python
-# Storage: float64 (AOTAutograd-friendly)
-flags = torch.zeros(N, num_words, dtype=torch.float64)
+import torch
+import torchguard as tg
 
-# Operations: view as int64 for bitwise ops (zero-copy)
-flags_i = flags.view(torch.int64)
-flags_i[:, 0] |= packed_slot  # Bitwise operations work!
+# Switch to experimental backend (float32)
+tg.CONFIG.flag_dtype = torch.float32
+
+# Storage: float32 (better inductor compatibility)
+flags = tg.err.new_t(N)  # Creates float32 flags
+
+# Operations: internally views as int32 for bitwise ops (zero-copy)
+flags = tg.err.push(flags, tg.ErrorCode.NAN, location=1)  # Works!
 ```
 
 **Key properties:**
 
-* Same bit layout (4×16-bit slots per 64-bit word)
+* float32: 2×16-bit slots per 32-bit word (8 words for 16 slots)
+* float64: 4×16-bit slots per 64-bit word (4 words for 16 slots)
 * Same API as stable backend
 * Zero overhead (`view` is zero-copy)
 * Works with `torch.compile(fullgraph=True)`
 * Training (forward + backward) works
 
-The experimental backend uses `float64` as the storage dtype for flags; all diagrams and bit layouts in this README still apply, because we reinterpret those 64 bits as `int64` internally for bit-packing.
+**Backend selection:**
+
+```python
+# float32 (recommended for inductor)
+tg.CONFIG.flag_dtype = torch.float32
+
+# float64 (more slots per word)
+tg.CONFIG.flag_dtype = torch.float64
+
+# Back to stable (int64)
+tg.CONFIG.flag_dtype = torch.int64
+```
 
 ### Critical Constraints
 
-**You must NEVER run floating-point operations on flags tensors.** The `float64` dtype is purely a storage carrier - the bit patterns are integer slots, not IEEE 754 floats. 
+**You must NEVER run floating-point operations on flags tensors.** The float dtype is purely a storage carrier - the bit patterns are integer slots, not IEEE 754 floats. 
 
 ```python
 # WRONG — corrupts flags
@@ -954,7 +1335,7 @@ from torchguard.experimental import err, IF, IS, HAS, AND, OR, NOT
 
 @torch.compile(backend="inductor", fullgraph=True)
 def forward(x):
-    f = err.new(x)  # Creates float64 flags
+    f = err.new(x)  # Creates float32 flags (default)
     
     # Same API as stable backend
     f = err.push(f, err.NAN, location=42, where=torch.isnan(x).any(dim=-1))
@@ -1020,23 +1401,30 @@ loss.backward()  # Works!
 ## Python Boundary Utilities
 
 <details>
-<summary><strong><code>Result</code> Type</strong></summary>
+<summary><strong><code>Result</code> Type (Additional Details)</strong></summary>
 
-TorchGuard includes a minimal `Result` type for exception handling at the Python boundary:
+The `Result` type is fully documented in the **Result-Oriented Programming** section under **Tensor Typing System** above.
+
+Quick reference:
 
 ```python
-from torchguard import Ok, Err, Result, as_result, as_exception
+from torchguard import Ok, Err, Result, as_result
 
+# Create Results directly
+success = Ok(42)
+failure = Err("Something went wrong")
+
+# Use decorator for automatic exception catching
 @as_result
-def run_inference(model, x):
-    return model(x)
+def might_fail(x):
+    if x < 0:
+        raise ValueError("Negative")
+    return x * 2
 
-result = run_inference(model, input_data)
-
-if result.is_ok():
-    output, f = result.unwrap()
-else:
-    print(f"Failed: {result.unwrap_err()}")
+result = might_fail(10)  # Ok(20)
+result = might_fail(-5)  # Err(ValueError("Negative"))
 ```
+
+See the **Result-Oriented Programming** section for full API details, chaining, and advanced patterns.
 
 </details>

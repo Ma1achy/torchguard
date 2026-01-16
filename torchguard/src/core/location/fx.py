@@ -6,21 +6,23 @@ as error locations using torch.fx tracing.
 """
 from __future__ import annotations
 
+# Standard library
 import warnings
 from typing import TYPE_CHECKING, Any, Dict
 
-from .registry import ErrorLocation
-
-if TYPE_CHECKING:
-    import torch.nn as nn
-
-# Check for torch.fx availability
+# Third-party - Check for torch.fx availability
 try:
     import torch
     import torch.fx as fx
     _HAS_FX = True
 except ImportError:
     _HAS_FX = False
+
+if TYPE_CHECKING:
+    import torch.nn as nn
+
+# Internal
+from .registry import ErrorLocation
 
 
 if _HAS_FX:

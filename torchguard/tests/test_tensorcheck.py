@@ -12,9 +12,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from torchguard import tensorcheck, tracked
+from torchguard import tensorcheck, tracked, Severity
 from torchguard import ErrorCode, ErrorLocation, error_t, err, flags as flags_ns, push
-from torchguard.src.core.severity import Severity
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -110,7 +109,8 @@ class TestClassDecoration:
     
     def setup_method(self) -> None:
         """Reset location registry before each test."""
-        ErrorLocation.reset()
+        import torchguard
+        torchguard.ErrorLocation.reset()
     
     def test_tracked_class_injects_fx_path(self) -> None:
         """Verify @tracked on class injects _fx_path into submodules."""
@@ -154,6 +154,10 @@ class TestClassDecoration:
     
     def test_tracked_class_registers_locations(self) -> None:
         """Verify @tracked registers all submodule paths with ErrorLocation."""
+        # Import dynamically to get the same instance as the decorator
+        import torchguard
+        EL = torchguard.ErrorLocation
+        
         @tracked
         class Model(nn.Module):
             def __init__(self):
@@ -167,8 +171,8 @@ class TestClassDecoration:
         model = Model()
         
         # Paths should be registered
-        assert ErrorLocation.is_registered("layer1")
-        assert ErrorLocation.is_registered("layer2")
+        assert EL.is_registered("layer1")
+        assert EL.is_registered("layer2")
     
     def test_tracked_class_returns_tuple(self) -> None:
         """Verify @tracked class returns raw tuple, not Result."""
@@ -507,6 +511,90 @@ class TestAutoDetect:
         
         # Sample 1 should have OOB (from manual push)
         assert err.is_err(flags)[1].item()
+    
+    def test_auto_detect_experimental_float32_flags(self) -> None:
+        """Verify auto_detect works with experimental float32 backend."""
+        import torchguard as tg
+        from torchguard.experimental import err as exp_err
+        
+        # Set CONFIG to float32 for experimental backend
+        original_dtype = tg.CONFIG.flag_dtype
+        tg.CONFIG.flag_dtype = torch.float32
+        
+        try:
+            @tracked
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                
+                @tensorcheck
+                def forward(self, x):
+                    # Use experimental backend (float32 flags)
+                    flags = exp_err.new(x)
+                    
+                    # Intentionally introduce NaN
+                    output = x.clone()
+                    output[0, 0] = float('nan')
+                    return output, flags
+            
+            model = Model()
+            x = torch.randn(2, 8)
+            
+            output, flags = model(x)
+            
+            # Flags should be float32
+            assert flags.dtype == torch.float32
+            # Shape should be (batch, 8) for experimental float32 backend
+            assert flags.shape == (2, 8)
+            
+            # Auto-detect should have found NaN in sample 0
+            assert exp_err.is_err(flags)[0].item()
+            assert exp_err.has_nan(flags)[0].item()
+            
+            # Sample 1 should be clean
+            assert exp_err.is_ok(flags)[1].item()
+        finally:
+            tg.CONFIG.flag_dtype = original_dtype
+    
+    def test_auto_detect_experimental_float32_compiles(self) -> None:
+        """Verify auto_detect with experimental float32 flags compiles."""
+        import torchguard as tg
+        from torchguard.experimental import err as exp_err
+        
+        # Set CONFIG to float32 for experimental backend
+        original_dtype = tg.CONFIG.flag_dtype
+        tg.CONFIG.flag_dtype = torch.float32
+        
+        try:
+            @tracked
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.linear = nn.Linear(8, 4)
+                
+                @tensorcheck
+                def forward(self, x):
+                    flags = exp_err.new(x)
+                    output = self.linear(x)
+                    # NaN/Inf auto-detection happens here - should compile!
+                    return output, flags
+            
+            model = Model()
+            compiled = torch.compile(model, backend="eager", fullgraph=True)
+            
+            # Clean input
+            x = torch.randn(3, 8)
+            output, flags = compiled(x)
+            assert exp_err.is_ok(flags).all().item()
+            
+            # Input that causes NaN in output
+            x_bad = torch.randn(3, 8)
+            x_bad[0, :] = float('nan')  # Explicit NaN in input will propagate
+            output, flags = compiled(x_bad)
+            # Sample 0 input has NaN, so output should have NaN detected
+            assert exp_err.has_nan(flags)[0].item()
+        finally:
+            tg.CONFIG.flag_dtype = original_dtype
 
 
 class TestAutoDetectEdgeCases:

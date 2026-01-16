@@ -5,19 +5,29 @@ Mirrors the stable err namespace but uses Float64ErrorOps.
 """
 from __future__ import annotations
 
+from typing import Optional, List, Union
+
+from typing import Optional
 import torch
 from torch import Tensor
 
 from .ops import Float64ErrorOps
 from ..core import ErrorCode, ErrorDomain, Severity
-from ..core.config import DEFAULT_CONFIG, ErrorConfig
+from ..core.config import ErrorConfig, get_config
+
+# Type alias for replace() targets parameter
+ReplaceTarget = Union[int, str, float]
+
+# Experimental backend uses float32 by default for better torch.compile compatibility
+_EXPERIMENTAL_DEFAULT = None  # Use global config
 
 
 class _XErrNamespace:
     """
     Experimental compiled-safe error operations namespace.
     
-    All methods return float64 tensors for AOTAutograd compatibility.
+    Returns float32 tensors by default (configurable via ErrorConfig.flag_dtype).
+    float32 default provides better torch.compile compatibility.
     API is identical to stable err namespace.
     """
     # Error codes as attributes
@@ -47,26 +57,26 @@ class _XErrNamespace:
     
     # === Creation ===
     @staticmethod
-    def new(reference):
-        """Create empty error flags tensor from reference. Returns float64."""
-        return Float64ErrorOps.new(reference)
+    def new(reference, config: Optional[ErrorConfig] = None):
+        """Create empty error flags tensor from reference. Returns float32 (default) or float64."""
+        return Float64ErrorOps.new(reference, config or get_config())
     
     @staticmethod
-    def new_t(batch_size, device=None, config=DEFAULT_CONFIG):
-        """Create empty error flags tensor from batch size. Returns float64."""
-        return Float64ErrorOps.new_t(batch_size, device, config)
+    def new_t(batch_size, device=None, config: Optional[ErrorConfig] = None):
+        """Create empty error flags tensor from batch size. Returns float32 (default) or float64."""
+        return Float64ErrorOps.new_t(batch_size, device, config or get_config())
     
     @staticmethod
-    def from_code(code, location, batch_size, device=None, severity=None, config=DEFAULT_CONFIG):
-        """Create flags with a single error code. Returns float64."""
+    def from_code(code, location, batch_size, device=None, severity=None, config: Optional[ErrorConfig] = None):
+        """Create flags with a single error code. Returns float32 (default) or float64."""
         if severity is None:
             severity = Severity.ERROR
-        return Float64ErrorOps.from_code(code, location, batch_size, device, severity, config)
+        return Float64ErrorOps.from_code(code, location, batch_size, device, severity, config or get_config())
     
     # === Recording ===
     @staticmethod
-    def push(flags, code, location, severity=None, config=DEFAULT_CONFIG, *, where=None):
-        """Push error code to flags. Returns float64."""
+    def push(flags, code, location, severity=None, config: Optional[ErrorConfig] = None, *, where=None):
+        """Push error code to flags. Preserves flag dtype (float32 or float64)."""
         if isinstance(code, torch.Tensor):
             from ..core.location import ErrorLocation
             if isinstance(location, str):
@@ -77,9 +87,10 @@ class _XErrNamespace:
                 loc = ErrorLocation.UNKNOWN
             if severity is None:
                 severity = Severity.ERROR
-            return Float64ErrorOps.push(flags, code, loc, severity, config)
+            return Float64ErrorOps.push(flags, code, loc, severity, config or get_config())
         else:
             # Use high-level push with where support
+            cfg = config or get_config()
             from ..core.location import ErrorLocation
             if isinstance(location, str):
                 loc = ErrorLocation.register(location)
@@ -90,18 +101,27 @@ class _XErrNamespace:
             if severity is None:
                 severity = ErrorCode.default_severity(code)
             
-            n = flags.shape[0]
+            int_dtype = cfg.torch_int_dtype
+            # Use compile-safe tensor creation (avoid shape[0] extraction)
+            # Create a template tensor from flags' first column for broadcasting
+            template = flags[:, 0]  # Shape (N,)
             if where is None:
-                code_tensor = torch.full((n,), code, dtype=torch.int64, device=flags.device)
+                # All samples get the code
+                code_tensor = torch.full_like(template, code, dtype=int_dtype)
             else:
-                code_tensor = torch.where(where, code, ErrorCode.OK)
+                # Only samples where 'where' is True get the code
+                code_tensor = torch.where(
+                    where, 
+                    torch.full_like(template, code, dtype=int_dtype),
+                    torch.full_like(template, ErrorCode.OK, dtype=int_dtype)
+                )
             
-            return Float64ErrorOps.push(flags, code_tensor, loc, severity, config)
+            return Float64ErrorOps.push(flags, code_tensor, loc, severity, cfg)
     
     @staticmethod
-    def merge(*flag_tensors, config=DEFAULT_CONFIG):
-        """Merge multiple flag tensors. Returns float64."""
-        return Float64ErrorOps.merge(*flag_tensors, config=config)
+    def merge(*flag_tensors, config: Optional[ErrorConfig] = None):
+        """Merge multiple flag tensors. Returns same dtype as input (float32 default)."""
+        return Float64ErrorOps.merge(*flag_tensors, config=config or get_config())
     
     # === Checking ===
     @staticmethod
@@ -120,34 +140,34 @@ class _XErrNamespace:
         return Float64ErrorOps.any_err(flags)
     
     @staticmethod
-    def has_nan(flags, config=DEFAULT_CONFIG):
+    def has_nan(flags, config: Optional[ErrorConfig] = None):
         """Per-sample bool mask for NaN errors."""
-        return Float64ErrorOps.has_nan(flags, config)
+        return Float64ErrorOps.has_nan(flags, config or get_config())
     
     @staticmethod
-    def has_inf(flags, config=DEFAULT_CONFIG):
+    def has_inf(flags, config: Optional[ErrorConfig] = None):
         """Per-sample bool mask for Inf errors."""
-        return Float64ErrorOps.has_inf(flags, config)
+        return Float64ErrorOps.has_inf(flags, config or get_config())
     
     @staticmethod
-    def has_code(flags, code, config=DEFAULT_CONFIG):
+    def has_code(flags, code, config: Optional[ErrorConfig] = None):
         """Per-sample bool mask for specific error code."""
-        return Float64ErrorOps.has_code(flags, code, config)
+        return Float64ErrorOps.has_code(flags, code, config or get_config())
     
     @staticmethod
-    def has_critical(flags, config=DEFAULT_CONFIG):
+    def has_critical(flags, config: Optional[ErrorConfig] = None):
         """Per-sample bool mask for critical errors."""
-        return Float64ErrorOps.has_critical(flags, config)
+        return Float64ErrorOps.has_critical(flags, config or get_config())
     
     @staticmethod
-    def count_errors(flags, config=DEFAULT_CONFIG):
+    def count_errors(flags, config: Optional[ErrorConfig] = None):
         """Count errors per sample."""
-        return Float64ErrorOps.count_errors(flags, config)
+        return Float64ErrorOps.count_errors(flags, config or get_config())
     
     @staticmethod
-    def max_severity(flags, config=DEFAULT_CONFIG):
+    def max_severity(flags, config: Optional[ErrorConfig] = None):
         """Get max severity per sample."""
-        return Float64ErrorOps.max_severity(flags, config)
+        return Float64ErrorOps.max_severity(flags, config or get_config())
     
     # === Filtering ===
     @staticmethod
@@ -213,16 +233,16 @@ class _XErrNamespace:
         return Float64ErrorOps.bind(flags, tensor, fn)
     
     @staticmethod
-    def guard(flags, tensor, predicate, code, location, severity=None, config=DEFAULT_CONFIG):
+    def guard(flags, tensor, predicate, code, location, severity=None, config: Optional[ErrorConfig] = None):
         """Push error where predicate is False."""
         if severity is None:
             severity = Severity.ERROR
-        return Float64ErrorOps.guard(flags, tensor, predicate, code, location, severity, config)
+        return Float64ErrorOps.guard(flags, tensor, predicate, code, location, severity, config or get_config())
     
     @staticmethod
-    def recover_with_fallback(flags, tensor, fallback, location, *, config=DEFAULT_CONFIG):
+    def recover_with_fallback(flags, tensor, fallback, location, *, config: Optional[ErrorConfig] = None):
         """Replace error samples with fallback value."""
-        return Float64ErrorOps.recover_with_fallback(flags, tensor, fallback, location, config=config)
+        return Float64ErrorOps.recover_with_fallback(flags, tensor, fallback, location, config=config or get_config())
     
     @staticmethod
     def all_ok(flags):
@@ -235,11 +255,11 @@ class _XErrNamespace:
         return Float64ErrorOps.any_err(flags)
     
     @staticmethod
-    def ensure_mask(flags, predicate, code, location, severity=None, config=DEFAULT_CONFIG):
+    def ensure_mask(flags, predicate, code, location, severity=None, config: Optional[ErrorConfig] = None):
         """Push error where predicate is False."""
         if severity is None:
             severity = Severity.ERROR
-        return Float64ErrorOps.ensure_mask(flags, predicate, code, location, severity, config)
+        return Float64ErrorOps.ensure_mask(flags, predicate, code, location, severity, config or get_config())
     
     @staticmethod
     def map_err_flags(flags, fn):
@@ -252,26 +272,26 @@ class _XErrNamespace:
         return Float64ErrorOps.partition_many(flags, *tensors)
     
     @staticmethod
-    def clear(flags, code, config=DEFAULT_CONFIG):
-        """Clear specific error code from flags. Returns float64."""
-        return Float64ErrorOps.clear(flags, code, config)
+    def clear(flags, code, config: Optional[ErrorConfig] = None):
+        """Clear specific error code from flags. Returns same dtype as input (float32 default)."""
+        return Float64ErrorOps.clear(flags, code, config or get_config())
     
     @staticmethod
-    def push_scalar(flags, code, location, severity=None, config=DEFAULT_CONFIG):
-        """Push scalar code to all samples. Returns float64."""
+    def push_scalar(flags, code, location, severity=None, config: Optional[ErrorConfig] = None):
+        """Push scalar code to all samples. Returns same dtype as input (float32 default)."""
         if severity is None:
             severity = Severity.ERROR
-        return Float64ErrorOps.push_scalar(flags, code, location, severity, config)
+        return Float64ErrorOps.push_scalar(flags, code, location, severity, config or get_config())
     
     @staticmethod
-    def has_domain(flags, domain, config=DEFAULT_CONFIG):
+    def has_domain(flags, domain, config: Optional[ErrorConfig] = None):
         """Per-sample bool mask for error domain."""
-        return Float64ErrorOps.has_domain(flags, domain, config)
+        return Float64ErrorOps.has_domain(flags, domain, config or get_config())
     
     @staticmethod
-    def has_fallback(flags, config=DEFAULT_CONFIG):
+    def has_fallback(flags, config: Optional[ErrorConfig] = None):
         """Per-sample bool mask for fallback values."""
-        return Float64ErrorOps.has_fallback(flags, config)
+        return Float64ErrorOps.has_fallback(flags, config or get_config())
     
     @staticmethod
     def get_first_code(flags):
@@ -289,9 +309,71 @@ class _XErrNamespace:
         return Float64ErrorOps.get_first_severity(flags)
     
     @staticmethod
-    def find(code, flags, config=DEFAULT_CONFIG):
+    def find(code, flags, config: Optional[ErrorConfig] = None):
         """Find which samples have a specific error code. Works with float64 flags."""
-        return Float64ErrorOps.has_code(flags, code, config)
+        return Float64ErrorOps.has_code(flags, code, config or get_config())
+    
+    # === Recovery ===
+    @staticmethod
+    def replace(t: Tensor, value: float = 0.0, *, targets: List[ReplaceTarget]) -> Tensor:
+        """
+        Replace target values in a tensor with a replacement value.
+        
+        Gradient-safe: gradients flow through non-replaced values,
+        replaced positions receive zero gradient. Unlike torch.zeros_like(),
+        this maintains gradient connections needed for torch.compile backward pass.
+        
+        Args:
+            t: Input tensor
+            value: Replacement value (default 0.0)
+            targets: Required list of values to replace. Can include:
+                - err.NAN or 'nan': Replace NaN values
+                - err.INF or 'inf': Replace all Inf values (+/-)
+                - 'posinf': Replace only +Inf
+                - 'neginf': Replace only -Inf
+                - Any float/int: Replace that exact numerical value
+            
+        Returns:
+            Tensor with target values replaced
+            
+        Examples:
+            # Replace NaN with 0:
+            z = err.replace(z, value=0.0, targets=[err.NAN])
+            
+            # Replace both NaN and Inf with 0:
+            z = err.replace(z, value=0.0, targets=[err.NAN, err.INF])
+            
+            # Replace specific numerical values:
+            z = err.replace(z, value=-1.0, targets=[0.0, -999.0])
+            
+            # Use in IF/ELIF/ELSE DSL:
+            z, flags = (
+                IF(IS(err.NAN, flags), lambda: (err.replace(z, value=0.0, targets=[err.NAN]), flags))
+                .ELIF(IS(err.INF, flags), lambda: (torch.clamp(z, min=-10.0, max=10.0), flags))
+                .ELSE(lambda: (z, flags))
+            )
+        
+        Raises:
+            ValueError: If targets is empty
+        """
+        if not targets:
+            raise ValueError("targets cannot be empty - specify what values to replace (e.g., [err.NAN, err.INF])")
+        
+        mask = torch.zeros_like(t, dtype=torch.bool)
+        
+        for target in targets:
+            if target in (ErrorCode.NAN, 'nan'):
+                mask = mask | torch.isnan(t)
+            elif target in (ErrorCode.INF, 'inf'):
+                mask = mask | torch.isinf(t)
+            elif target == 'posinf':
+                mask = mask | (t == float('inf'))
+            elif target == 'neginf':
+                mask = mask | (t == float('-inf'))
+            elif isinstance(target, (int, float)):
+                mask = mask | (t == target)
+        
+        return torch.where(mask, value, t)
 
 
 # Singleton instance

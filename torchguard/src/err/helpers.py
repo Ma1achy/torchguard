@@ -20,8 +20,9 @@ import torch
 from torch import Tensor
 
 from ..core.codes import ErrorCode
-from ..core.config import DEFAULT_CONFIG, ErrorConfig
+from ..core.config import ErrorConfig, get_config
 from ..core.constants import CODE_SHIFT, SLOT_BITS, SLOT_MASK, SLOTS_PER_WORD
+from ..core.device_cache import get_device_cache
 from ..core.severity import Severity
 from .ops import ErrorOps
 from ..core.location import ErrorLocation
@@ -147,14 +148,20 @@ def has_err(flags: Tensor) -> bool:
     Returns:
         (bool): True if any sample has any error
     """
-    return bool(ErrorOps.any_err(flags))
+    # Use experimental backend for float dtypes (float32 or float64)
+    if flags.dtype in (torch.float32, torch.float64):
+        from ..experimental.ops import Float64ErrorOps
+        return bool(Float64ErrorOps.any_err(flags))
+    else:
+        return bool(ErrorOps.any_err(flags))
 
 
-def find(code: int, flags: Tensor, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor:
+def find(code: int, flags: Tensor, config: Optional[ErrorConfig] = None) -> Tensor:
     """
     Find which samples have a specific error code. Fully vectorized.
     
     Safe for hot path - all tensor ops, torch.compile friendly.
+    Automatically handles both int64 (stable) and float64 (experimental) backends.
     
     Args:
         code (int): Error code to search for
@@ -164,23 +171,35 @@ def find(code: int, flags: Tensor, config: ErrorConfig = DEFAULT_CONFIG) -> Tens
     Returns:
         (Tensor): Boolean mask (N,) - True where sample has this error
     """
+    cfg = config or get_config()
+    
+    # Use experimental backend for float dtypes (float32 or float64)
+    if flags.dtype in (torch.float32, torch.float64):
+        from ..experimental.ops import Float64ErrorOps
+        return Float64ErrorOps.has_code(flags, code, cfg)
+    
+    # Stable int64 backend
+    cache = get_device_cache()
     N, num_words = flags.shape
     device = flags.device
     dtype = flags.dtype
     
-    slot_shifts = torch.arange(SLOTS_PER_WORD, device=device, dtype=dtype) * SLOT_BITS
+    # Use cached slot shifts
+    slot_shifts = cache.get_slot_shifts(device, dtype, SLOTS_PER_WORD, SLOT_BITS)
     words = flags.unsqueeze(-1)
     slots = (words >> slot_shifts) & SLOT_MASK
     slot_codes = (slots >> CODE_SHIFT) & 0xF
     
     total_slots = num_words * SLOTS_PER_WORD
-    if config.num_slots < total_slots:
-        valid = torch.arange(total_slots, device=device) < config.num_slots
+    if cfg.num_slots < total_slots:
+        # Use cached slot indices
+        valid = cache.get_slot_indices(device, total_slots) < cfg.num_slots
         valid = valid.view(num_words, SLOTS_PER_WORD)
+        # Use scalar broadcast instead of torch.zeros(1, ...)
         slot_codes = torch.where(
             valid.unsqueeze(0),
             slot_codes,
-            torch.zeros(1, dtype=dtype, device=device)
+            torch.zeros((), dtype=dtype, device=device)
         )
     
     matches = (slot_codes == code)
@@ -191,12 +210,16 @@ def find(code: int, flags: Tensor, config: ErrorConfig = DEFAULT_CONFIG) -> Tens
 # CORE PUSH FUNCTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def push(flags: Tensor, code: int, module: Union[nn.Module, int, str, None], *, where: Optional[Tensor] = None, severity: Optional[int] = None, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor:
+def push(flags: Tensor, code: int, module: Union[nn.Module, int, str, None], *, where: Optional[Tensor] = None, severity: Optional[int] = None, config: Optional[ErrorConfig] = None) -> Tensor:
     """
     Push error code into flags where condition is True.
     
     Location auto-resolved from module at trace-time.
     Severity auto-resolved from code if not provided.
+    Config auto-resolved from flags dtype if not provided.
+    
+    Automatically detects experimental (float64/float32) vs stable (int64) backend
+    based on flags dtype.
     
     Args:
         flags (Tensor): Existing error flags (N, num_words)
@@ -204,7 +227,7 @@ def push(flags: Tensor, code: int, module: Union[nn.Module, int, str, None], *, 
         module (Union[nn.Module, int, str, None]): Module for auto-location
         where (Optional[Tensor]): Boolean mask (N,) - only push where True
         severity (Optional[int]): Severity (auto from code if None)
-        config (ErrorConfig): Error configuration
+        config (Optional[ErrorConfig]): Error configuration (auto from flags dtype if None)
     
     Returns:
         (Tensor): Updated error flags
@@ -214,27 +237,51 @@ def push(flags: Tensor, code: int, module: Union[nn.Module, int, str, None], *, 
     if severity is None:
         severity = ErrorCode.default_severity(code)
     
-    n = flags.shape[0]
+    # Use compile-safe tensor creation (avoid shape[0] extraction)
+    template = flags[:, 0]  # Shape (N,) - preserves symbolic shapes
     
-    if where is not None and where.shape[0] != n:
-        raise ValueError(
-            f"where mask shape mismatch: flags has {n} samples, "
-            f"mask has {where.shape[0]} samples"
-        )
-    
-    if where is None:
-        code_tensor = torch.full((n,), code, dtype=torch.int64, device=flags.device)
+    # Use experimental backend for float dtypes (float32 or float64)
+    if flags.dtype in (torch.float32, torch.float64):
+        from ..experimental.ops import Float64ErrorOps
+        
+        # Use provided config or fall back to global config
+        cfg = config or get_config()
+        config = cfg
+        
+        int_dtype = torch.int32 if flags.dtype == torch.float32 else torch.int64
+        
+        if where is None:
+            code_tensor = torch.full_like(template, code, dtype=int_dtype)
+        else:
+            code_tensor = torch.where(
+                where, 
+                torch.full_like(template, code, dtype=int_dtype),
+                torch.full_like(template, ErrorCode.OK, dtype=int_dtype)
+            )
+        
+        return Float64ErrorOps.push(flags, code_tensor, loc, severity, config)
     else:
-        code_tensor = torch.where(where, code, ErrorCode.OK)
-    
-    return ErrorOps.push(flags, code_tensor, loc, severity, config)
+        # Stable backend for int64/int32 flags
+        cfg = config or get_config()
+        config = cfg
+        
+        if where is None:
+            code_tensor = torch.full_like(template, code, dtype=torch.int64)
+        else:
+            code_tensor = torch.where(
+                where, 
+                torch.full_like(template, code, dtype=torch.int64),
+                torch.full_like(template, ErrorCode.OK, dtype=torch.int64)
+            )
+        
+        return ErrorOps.push(flags, code_tensor, loc, severity, config)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FIX FUNCTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def fix(tensor: Tensor, flags: Tensor, module: Union[nn.Module, int, str, None], fallback: Union[float, Tensor, Callable[[], Tensor]] = 0.0, config: ErrorConfig = DEFAULT_CONFIG) -> Tuple[Tensor, Tensor]:
+def fix(tensor: Tensor, flags: Tensor, module: Union[nn.Module, int, str, None], fallback: Union[float, Tensor, Callable[[], Tensor]] = 0.0, config: Optional[ErrorConfig] = None) -> Tuple[Tensor, Tensor]:
     """
     Replace bad values (where flags have errors) with fallback.
     
@@ -250,8 +297,15 @@ def fix(tensor: Tensor, flags: Tensor, module: Union[nn.Module, int, str, None],
     Returns:
         (Tuple[Tensor, Tensor]): (cleaned_tensor, updated_flags)
     """
+    cfg = config or get_config()
     loc = resolve_location(module)
-    bad_mask = ErrorOps.is_err(flags)
+    
+    # Use experimental backend for float dtypes (float32 or float64)
+    if flags.dtype in (torch.float32, torch.float64):
+        from ..experimental.ops import Float64ErrorOps
+        bad_mask = Float64ErrorOps.is_err(flags)
+    else:
+        bad_mask = ErrorOps.is_err(flags)
     
     if callable(fallback):
         fallback_val = fallback()
@@ -265,8 +319,20 @@ def fix(tensor: Tensor, flags: Tensor, module: Union[nn.Module, int, str, None],
     
     cleaned = torch.where(bad_mask_exp, fallback_val, tensor)
     
-    code = torch.where(bad_mask, ErrorCode.FALLBACK_VALUE, ErrorCode.OK)
-    updated_flags = ErrorOps.push(flags, code, loc, Severity.WARN, config)
+    cache = get_device_cache()
+    int_dtype = torch.int32 if flags.dtype == torch.float32 else torch.int64
+    code = torch.where(
+        bad_mask, 
+        cache.get_constant(float(ErrorCode.FALLBACK_VALUE), flags.device, int_dtype),
+        cache.get_constant(float(ErrorCode.OK), flags.device, int_dtype)
+    )
+    
+    # Use experimental backend for float dtypes
+    if flags.dtype in (torch.float32, torch.float64):
+        from ..experimental.ops import Float64ErrorOps
+        updated_flags = Float64ErrorOps.push(flags, code, loc, Severity.WARN, cfg)
+    else:
+        updated_flags = ErrorOps.push(flags, code, loc, Severity.WARN, cfg)
     
     return cleaned, updated_flags
 
@@ -287,7 +353,7 @@ def fix(tensor: Tensor, flags: Tensor, module: Union[nn.Module, int, str, None],
 # Use push() directly when you need more control over the detection logic.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def flag_nan(tensor: Tensor, module: Union[nn.Module, int, str, None], flags: Optional[Tensor] = None, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor:
+def flag_nan(tensor: Tensor, module: Union[nn.Module, int, str, None], flags: Optional[Tensor] = None, config: Optional[ErrorConfig] = None) -> Tensor:
     """
     Check tensor for NaN and write ErrorCode.NAN to flags. Traceable, hot-path safe.
     
@@ -302,19 +368,21 @@ def flag_nan(tensor: Tensor, module: Union[nn.Module, int, str, None], flags: Op
         tensor (Tensor): Input tensor to check (N, ...)
         module (Union[nn.Module, int, str, None]): Module for auto-location
         flags (Optional[Tensor]): Existing flags, or None to create new
-        config (ErrorConfig): Error configuration
+        config (Optional[ErrorConfig]): Error configuration (auto from flags dtype if None)
     
     Returns:
         (Tensor): Updated error flags with NAN code where detected
     """
     n = tensor.shape[0]
     if flags is None:
+        if config is None:
+            config = get_config()
         flags = ErrorOps.new_t(n, tensor.device, config)
     nan_mask = torch.isnan(tensor).view(n, -1).any(dim=-1)
     return push(flags, ErrorCode.NAN, module, where=nan_mask, config=config)
 
 
-def flag_inf(tensor: Tensor, module: Union[nn.Module, int, str, None], flags: Optional[Tensor] = None, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor:
+def flag_inf(tensor: Tensor, module: Union[nn.Module, int, str, None], flags: Optional[Tensor] = None, config: Optional[ErrorConfig] = None) -> Tensor:
     """
     Check tensor for Inf and write ErrorCode.INF to flags. Traceable, hot-path safe.
     
@@ -329,19 +397,66 @@ def flag_inf(tensor: Tensor, module: Union[nn.Module, int, str, None], flags: Op
         tensor (Tensor): Input tensor to check (N, ...)
         module (Union[nn.Module, int, str, None]): Module for auto-location
         flags (Optional[Tensor]): Existing flags, or None to create new
-        config (ErrorConfig): Error configuration
+        config (Optional[ErrorConfig]): Error configuration (auto from flags dtype if None)
     
     Returns:
         (Tensor): Updated error flags with INF code where detected
     """
     n = tensor.shape[0]
     if flags is None:
+        if config is None:
+            config = get_config()
         flags = ErrorOps.new_t(n, tensor.device, config)
     inf_mask = torch.isinf(tensor).view(n, -1).any(dim=-1)
     return push(flags, ErrorCode.INF, module, where=inf_mask, config=config)
 
 
-def flag_oob_indices(indices: Tensor, num_embeddings: int, module: Union[nn.Module, int, str, None], flags: Optional[Tensor] = None, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor:
+def flag_nan_and_inf(tensor: Tensor, module: Union[nn.Module, int, str, None], flags: Optional[Tensor] = None, config: Optional[ErrorConfig] = None) -> Tensor:
+    """
+    Check tensor for both NaN and Inf in a single fused pass. Traceable, hot-path safe.
+    
+    This is more efficient than calling flag_nan() and flag_inf() separately when
+    you want to detect both issues, as it only iterates through the tensor once.
+    
+    Records ErrorCode.NAN for samples with NaN, ErrorCode.INF for samples with Inf.
+    If a sample has both, both error codes are pushed (NaN first, then Inf).
+    
+    Equivalent to:
+        nan_mask = torch.isnan(tensor).view(n, -1).any(dim=-1)
+        flags = push(flags, ErrorCode.NAN, module, where=nan_mask)
+        inf_mask = torch.isinf(tensor).view(n, -1).any(dim=-1)
+        flags = push(flags, ErrorCode.INF, module, where=inf_mask)
+    
+    Args:
+        tensor (Tensor): Input tensor to check (N, ...)
+        module (Union[nn.Module, int, str, None]): Module for auto-location
+        flags (Optional[Tensor]): Existing flags, or None to create new
+        config (Optional[ErrorConfig]): Error configuration (auto from flags dtype if None)
+    
+    Returns:
+        (Tensor): Updated error flags with NAN and/or INF codes where detected
+    """
+    n = tensor.shape[0]
+    if flags is None:
+        if config is None:
+            config = get_config()
+        flags = ErrorOps.new_t(n, tensor.device, config)
+    
+    # Single reshape for both checks
+    flat = tensor.view(n, -1)
+    
+    # Check for NaN and Inf in a single iteration (fused)
+    nan_mask = torch.isnan(flat).any(dim=-1)
+    inf_mask = torch.isinf(flat).any(dim=-1)
+    
+    # Push both error codes
+    flags = push(flags, ErrorCode.NAN, module, where=nan_mask, config=config)
+    flags = push(flags, ErrorCode.INF, module, where=inf_mask, config=config)
+    
+    return flags
+
+
+def flag_oob_indices(indices: Tensor, num_embeddings: int, module: Union[nn.Module, int, str, None], flags: Optional[Tensor] = None, config: Optional[ErrorConfig] = None) -> Tensor:
     """
     Check indices for out-of-bounds and write ErrorCode.OUT_OF_BOUNDS to flags.
     
@@ -357,13 +472,15 @@ def flag_oob_indices(indices: Tensor, num_embeddings: int, module: Union[nn.Modu
         num_embeddings (int): Size of the embedding table (valid range: 0 to num_embeddings-1)
         module (Union[nn.Module, int, str, None]): Module for auto-location
         flags (Optional[Tensor]): Existing flags, or None to create new
-        config (ErrorConfig): Error configuration
+        config (Optional[ErrorConfig]): Error configuration (auto from flags dtype if None)
     
     Returns:
         (Tensor): Updated error flags with OUT_OF_BOUNDS code where detected
     """
     n = indices.shape[0]
     if flags is None:
+        if config is None:
+            config = get_config()
         flags = ErrorOps.new_t(n, indices.device, config)
     flat = indices.view(n, -1)
     oob_mask = ((flat < 0) | (flat >= num_embeddings)).any(dim=-1)

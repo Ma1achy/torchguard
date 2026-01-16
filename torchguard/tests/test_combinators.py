@@ -22,7 +22,7 @@ from torchguard import (
     ErrorCode,
     ErrorLocation,
     Severity,
-    DEFAULT_CONFIG,
+    CONFIG,
     err,
     flags as flags_ns,
 )

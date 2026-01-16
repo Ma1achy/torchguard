@@ -34,7 +34,7 @@ from torchguard import (
     Order,
     Dedupe,
     ErrorConfig,
-    DEFAULT_CONFIG,
+    CONFIG,
     # Constants
     SLOT_BITS,
     SLOTS_PER_WORD,
@@ -173,16 +173,16 @@ class TestErrorConfig:
 
     def test_default_config(self) -> None:
         """
-        Verify DEFAULT_CONFIG has expected values.
+        Verify CONFIG has expected values.
         
-        Expected: 16 slots, LIFO accumulation, ERROR severity.
+        Expected: 16 slots, FIFO accumulation (root cause preservation), ERROR severity.
         """
-        assert DEFAULT_CONFIG.num_slots == 16
-        assert DEFAULT_CONFIG.accumulation.priority == Priority.CHRONO
-        assert DEFAULT_CONFIG.accumulation.order == Order.LAST
-        assert DEFAULT_CONFIG.accumulation.dedupe == Dedupe.UNIQUE
-        assert DEFAULT_CONFIG.default_severity == Severity.ERROR
-        assert DEFAULT_CONFIG.num_words == 4  # 16 slots / 4 slots per word
+        assert CONFIG.num_slots == 16
+        assert CONFIG.accumulation.priority == Priority.CHRONO
+        assert CONFIG.accumulation.order == Order.FIRST  # FIFO: preserve root causes
+        assert CONFIG.accumulation.dedupe == Dedupe.UNIQUE
+        assert CONFIG.default_severity == Severity.ERROR
+        assert CONFIG.num_words == 4  # 16 slots / 4 slots per word
 
     def test_custom_config(self) -> None:
         """Custom config should work."""
@@ -212,21 +212,21 @@ class TestErrorFlagsCreation:
     def test_ok_creates_zeros(self) -> None:
         """ok() should create all-zero tensor with correct shape."""
         flags = err.new_t(10, torch.device('cpu'))
-        assert flags.shape == (10, DEFAULT_CONFIG.num_words)
-        assert flags.dtype == torch.int64
+        assert flags.shape == (10, CONFIG.num_words)
+        assert flags.dtype == CONFIG.flag_dtype
         assert (flags == 0).all()
 
     def test_ok_custom_config(self) -> None:
         """ok() should respect custom config."""
-        config = ErrorConfig(num_slots=4)
+        config = ErrorConfig(num_slots=4, flag_dtype=torch.float64)
         flags = err.new_t(5, config=config)
-        assert flags.shape == (5, 1)  # 4 slots = 1 word
+        assert flags.shape == (5, 1)  # 4 slots with float64 = 1 word (4 slots/word)
 
     def test_from_code(self) -> None:
         """from_code() should create tensor with packed error."""
         flags = err.from_code(ErrorCode.NAN, ErrorLocation.register("customer_encoder"), 5,
                                       severity=Severity.CRITICAL)
-        assert flags.shape == (5, DEFAULT_CONFIG.num_words)
+        assert flags.shape == (5, CONFIG.num_words)
         assert (flags[:, 0] != 0).all()  # Error in slot 0
 
         code = err.get_first_code(flags)
@@ -313,7 +313,7 @@ class TestErrorFlagsPushModes:
 
     def test_push_with_error_condition(self) -> None:
         """push() should only add error where code != OK."""
-        config = DEFAULT_CONFIG
+        config = CONFIG
         flags = err.new_t(3, config=config)
         codes = torch.tensor([ErrorCode.NAN, ErrorCode.OK, ErrorCode.INF], dtype=torch.int64)
         flags = err.push(flags, codes, ErrorLocation.register("customer_encoder"), 
@@ -511,7 +511,7 @@ class TestCompileCompatibility:
 
     def test_ok_compiles(self) -> None:
         """err.new_t() should compile."""
-        config = DEFAULT_CONFIG
+        config = CONFIG
         
         @torch.compile(backend="eager")
         def fn(n: int) -> Tensor:
@@ -522,7 +522,7 @@ class TestCompileCompatibility:
 
     def test_push_compiles(self) -> None:
         """err.push() should compile."""
-        config = DEFAULT_CONFIG
+        config = CONFIG
         
         @torch.compile(backend="eager")
         def fn(flags: Tensor, codes: Tensor) -> Tensor:
@@ -559,7 +559,7 @@ class TestCompileCompatibility:
 
     def test_checks_compile(self) -> None:
         """Check methods should compile."""
-        config = DEFAULT_CONFIG
+        config = CONFIG
         
         @torch.compile(backend="eager")
         def fn(flags: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:

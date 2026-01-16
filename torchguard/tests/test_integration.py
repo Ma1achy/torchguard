@@ -228,14 +228,14 @@ class TestLargeBatchPerformance:
     
     def test_large_batch_error_flags_creation(self) -> None:
         """err.new_t() should handle 100k samples efficiently."""
-        from torchguard import DEFAULT_CONFIG, err
+        from torchguard import CONFIG, err
         n = 100_000
         
         start = time.perf_counter()
         flags = err.new_t(n)
         elapsed = time.perf_counter() - start
         
-        assert flags.shape == (n, DEFAULT_CONFIG.num_words)  # 4 words with 16 slots default
+        assert flags.shape == (n, CONFIG.num_words)  # 4 words with 16 slots default
         assert elapsed < 1.0  # Should be fast (< 1 second)
     
     def test_large_batch_push(self) -> None:
@@ -539,7 +539,7 @@ class TestLocationCacheGC:
     
     def test_location_cache_does_not_leak(self) -> None:
         """Creating and destroying many modules shouldn't leak memory."""
-        from torchguard.src.err.helpers import _LOCATION_CACHE, resolve_location
+        from src.err.helpers import _LOCATION_CACHE, resolve_location
         
         initial_cache_size = len(_LOCATION_CACHE)
         
@@ -571,7 +571,7 @@ class TestLocationCacheGC:
     
     def test_repeated_resolution_uses_cache(self) -> None:
         """Resolving same module multiple times should hit cache."""
-        from torchguard.src.err.helpers import resolve_location
+        from src.err.helpers import resolve_location
         
         module = nn.Linear(10, 10)
         module._fx_path = "cached_test"

@@ -43,7 +43,10 @@ import torch
 from torch import Tensor
 
 from ..core.codes import ErrorCode
-from ..core.config import DEFAULT_CONFIG, Dedupe, ErrorConfig, Order, Priority
+from ..core.config import Dedupe, ErrorConfig, Order, Priority, get_config
+from ..core.device_cache import get_device_cache
+
+# Stable backend default: uses int64 with 4 slots/word
 from ..core.constants import CODE_SHIFT, LOCATION_SHIFT, SEVERITY_MASK, SLOT_BITS, SLOT_MASK, SLOTS_PER_WORD
 from ..core.severity import Severity
 
@@ -148,9 +151,10 @@ class ErrorOps:
         """
         n, num_words = flags.shape
         device = flags.device
+        cache = get_device_cache()
         
         # Shift amounts for each slot position within a word: [0, 16, 32, 48]
-        shifts = torch.arange(SLOTS_PER_WORD, device=device, dtype=torch.int64) * SLOT_BITS
+        shifts = cache.get_slot_shifts(device, torch.int64, SLOTS_PER_WORD, SLOT_BITS)
         
         # Broadcast: (n, num_words, 1) >> (4,) -> (n, num_words, 4)
         expanded = flags.unsqueeze(-1) >> shifts
@@ -182,7 +186,8 @@ class ErrorOps:
         reshaped = padded.reshape(n, num_words, SLOTS_PER_WORD)
         
         # Shift each slot to its bit position within the word
-        shifts = torch.arange(SLOTS_PER_WORD, device=device, dtype=torch.int64) * SLOT_BITS
+        cache = get_device_cache()
+        shifts = cache.get_slot_shifts(device, torch.int64, SLOTS_PER_WORD, SLOT_BITS)
         shifted = reshaped << shifts  # (n, num_words, 4)
         
         # Combine slots within each word using bitwise OR via sum (slots don't overlap)
@@ -237,7 +242,7 @@ class ErrorOps:
             - slot_idx: index of first matching slot (0 if none)
         """
         # Extract all slots: (N, num_slots)
-        all_slots = ErrorOps.__extract_all_slots(flags, config)
+        all_slots = ErrorOps.__extract_all_slots(flags, config or get_config())
         
         # Apply predicate: (N, num_slots) bool
         matches = pred_fn(all_slots)
@@ -251,10 +256,12 @@ class ErrorOps:
         # But we need to handle "no match" case - use large negative for non-matches
         match_scores = matches.float()
         # Add position penalty to prefer earlier slots when multiple match
-        positions = torch.arange(config.num_slots, device=flags.device, dtype=torch.float32)
+        cache = get_device_cache()
+        positions = cache.get_position_array(flags.device, torch.float32, config.num_slots)
         # Score: 1.0 for match, 0.0 for non-match, minus tiny position penalty
         scores = match_scores - positions * 1e-6
-        scores = torch.where(matches, scores, torch.tensor(-float('inf'), device=flags.device))
+        # Use scalar -inf directly (PyTorch broadcasts automatically)
+        scores = torch.where(matches, scores, float('-inf'))
         slot_idx = scores.argmax(dim=1)  # (N,)
         
         return exists, slot_idx
@@ -274,18 +281,19 @@ class ErrorOps:
             (N, num_words) with slot replaced
         """
         # Extract all slots
-        all_slots = ErrorOps.__extract_all_slots(flags, config)  # (N, num_slots)
+        all_slots = ErrorOps.__extract_all_slots(flags, config or get_config())  # (N, num_slots)
         n, num_slots = all_slots.shape
         
         # Create index mask for the target slot
-        indices = torch.arange(num_slots, device=flags.device).unsqueeze(0)  # (1, num_slots)
+        cache = get_device_cache()
+        indices = cache.get_slot_indices(flags.device, num_slots).unsqueeze(0)  # (1, num_slots)
         is_target = (indices == slot_idx.unsqueeze(1))  # (N, num_slots)
         
         # Replace target slot
         updated = torch.where(is_target, new_slot.unsqueeze(1), all_slots)
         
         # Pack back
-        return ErrorOps.__pack_all_slots(updated, config)
+        return ErrorOps.__pack_all_slots(updated, config or get_config())
     
     # ═══════════════════════════════════════════════════════════════════════════
     # CREATION
@@ -313,10 +321,11 @@ class ErrorOps:
         Example:
             >>> flags = ErrorOps.new(x)  # Shape: (batch_size, 64)
         """
-        return torch.zeros(x.shape[0], DEFAULT_CONFIG.num_words, dtype=torch.int64, device=x.device)
+        config = get_config()
+        return torch.zeros(x.shape[0], config.num_words, dtype=torch.int64, device=x.device)
     
     @staticmethod
-    def new_t(n: int, device: Optional[torch.device] = None, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int64_t, ("N", "num_words")]:
+    def new_t(n: int, device: Optional[torch.device] = None, config: Optional[ErrorConfig] = None) -> Tensor[int64_t, ("N", "num_words")]:
         """
         Create empty error flags with explicit arguments.
         
@@ -340,7 +349,7 @@ class ErrorOps:
         return torch.zeros(n, config.num_words, dtype=torch.int64, device=device)
     
     @staticmethod
-    def from_code(code: int, location: int, n: int, device: Optional[torch.device] = None, severity: int = Severity.ERROR, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int64_t, ("N", "num_words")]:
+    def from_code(code: int, location: int, n: int, device: Optional[torch.device] = None, severity: int = Severity.ERROR, config: Optional[ErrorConfig] = None) -> Tensor[int64_t, ("N", "num_words")]:
         """
         Create flags with a single error for all samples.
         
@@ -364,7 +373,7 @@ class ErrorOps:
         Example:
             >>> flags = ErrorOps.from_code(ErrorCode.NAN, loc_id, batch_size)
         """
-        flags = ErrorOps.new_t(n, device, config)
+        flags = ErrorOps.new_t(n, device, config or get_config())
         packed = ErrorOps.__pack_slot(code, location, severity)
         flags[:, 0] = packed
         return flags
@@ -374,7 +383,7 @@ class ErrorOps:
     # ═══════════════════════════════════════════════════════════════════════════
     
     @staticmethod
-    def push(flags: Tensor[int64_t, ("N", "num_words")], code: Tensor[int64_t, ("N",)], location: int, severity: int = Severity.ERROR, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int64_t, ("N", "num_words")]:
+    def push(flags: Tensor[int64_t, ("N", "num_words")], code: Tensor[int64_t, ("N",)], location: int, severity: int = Severity.ERROR, config: Optional[ErrorConfig] = None) -> Tensor[int64_t, ("N", "num_words")]:
         """
         Push new error into flags. Fully compilable.
         
@@ -403,13 +412,13 @@ class ErrorOps:
         acc = config.accumulation
         
         if acc.dedupe == Dedupe.LOCATION:
-            return ErrorOps.__push_dedupe_location(flags, code, location, severity, config)
+            return ErrorOps.__push_dedupe_location(flags, code, location, severity, config or get_config())
         elif acc.dedupe == Dedupe.CODE:
-            return ErrorOps.__push_dedupe_code(flags, code, location, severity, config)
+            return ErrorOps.__push_dedupe_code(flags, code, location, severity, config or get_config())
         elif acc.dedupe == Dedupe.UNIQUE:
-            return ErrorOps.__push_dedupe_unique(flags, code, location, severity, config)
+            return ErrorOps.__push_dedupe_unique(flags, code, location, severity, config or get_config())
         else:  # Dedupe.NONE
-            return ErrorOps.__push_no_dedupe(flags, code, location, severity, config)
+            return ErrorOps.__push_no_dedupe(flags, code, location, severity, config or get_config())
     
     @staticmethod
     def __push_no_dedupe(flags: Tensor, code: Tensor, location: int, severity: int, config: ErrorConfig) -> Tensor:
@@ -417,13 +426,13 @@ class ErrorOps:
         acc = config.accumulation
         if acc.priority == Priority.CHRONO:
             if acc.order == Order.LAST:
-                return ErrorOps.__push_chrono_last(flags, code, location, severity, config)
+                return ErrorOps.__push_chrono_last(flags, code, location, severity, config or get_config())
             else:
-                return ErrorOps.__push_chrono_first(flags, code, location, severity, config)
+                return ErrorOps.__push_chrono_first(flags, code, location, severity, config or get_config())
         elif acc.priority == Priority.SEVERITY:
-            return ErrorOps.__push_severity_based(flags, code, location, severity, config)
+            return ErrorOps.__push_severity_based(flags, code, location, severity, config or get_config())
         else:
-            return ErrorOps.__push_chrono_last(flags, code, location, severity, config)
+            return ErrorOps.__push_chrono_last(flags, code, location, severity, config or get_config())
     
     @staticmethod
     def __push_chrono_last(flags: Tensor, code: Tensor, location: int, severity: int, config: ErrorConfig) -> Tensor:
@@ -443,12 +452,12 @@ class ErrorOps:
         new_slot = ErrorOps.__pack_slot_tensor(code, location, severity)
         
         # Count existing errors to find insertion point
-        error_count = ErrorOps.count_errors(flags, config).to(torch.int64)
+        error_count = ErrorOps.count_errors(flags, config or get_config()).to(torch.int64)
         has_space = error_count < config.num_slots
         should_push = should_push & has_space
         
         # Use vectorized slot replacement at the error_count position
-        result = ErrorOps.__replace_slot_at(flags, error_count, new_slot, config)
+        result = ErrorOps.__replace_slot_at(flags, error_count, new_slot, config or get_config())
         
         return torch.where(should_push.unsqueeze(-1), result, flags)
     
@@ -459,7 +468,7 @@ class ErrorOps:
         new_slot = ErrorOps.__pack_slot_tensor(code, location, severity)
         
         # Extract all slots and find minimum severity
-        all_slots = ErrorOps.__extract_all_slots(flags, config)  # (N, num_slots)
+        all_slots = ErrorOps.__extract_all_slots(flags, config or get_config())  # (N, num_slots)
         severities = all_slots & SEVERITY_MASK  # (N, num_slots)
         
         # Find slot with minimum severity (argmin)
@@ -467,11 +476,11 @@ class ErrorOps:
         min_sev = severities.gather(1, min_slot_idx.unsqueeze(1)).squeeze(1)  # (N,)
         
         should_replace = should_push & (severity > min_sev)
-        result = ErrorOps.__replace_slot_at(flags, min_slot_idx, new_slot, config)
+        result = ErrorOps.__replace_slot_at(flags, min_slot_idx, new_slot, config or get_config())
         
         return torch.where(
             should_replace.unsqueeze(-1), result,
-            torch.where(should_push.unsqueeze(-1), ErrorOps.__push_chrono_last(flags, code, location, severity, config), flags)
+            torch.where(should_push.unsqueeze(-1), ErrorOps.__push_chrono_last(flags, code, location, severity, config or get_config()), flags)
         )
     
     @staticmethod
@@ -485,12 +494,12 @@ class ErrorOps:
             slot_loc = (slots >> LOCATION_SHIFT) & 0x3FF
             return (slot_loc == location) & (slots != 0)
         
-        loc_exists, existing_slot_idx = ErrorOps.__find_slot_matching(flags, match_location, config)
+        loc_exists, existing_slot_idx = ErrorOps.__find_slot_matching(flags, match_location, config or get_config())
         
         return torch.where(
             (loc_exists & should_push).unsqueeze(-1),
-            ErrorOps.__update_slot_if_worse(flags, existing_slot_idx, new_slot, config),
-            torch.where((~loc_exists & should_push).unsqueeze(-1), ErrorOps.__push_no_dedupe(flags, code, location, severity, config), flags)
+            ErrorOps.__update_slot_if_worse(flags, existing_slot_idx, new_slot, config or get_config()),
+            torch.where((~loc_exists & should_push).unsqueeze(-1), ErrorOps.__push_no_dedupe(flags, code, location, severity, config or get_config()), flags)
         )
     
     @staticmethod
@@ -500,7 +509,7 @@ class ErrorOps:
         new_slot = ErrorOps.__pack_slot_tensor(code, location, severity)
         
         # Extract all slots and check for matching code (per-sample)
-        all_slots = ErrorOps.__extract_all_slots(flags, config)  # (N, num_slots)
+        all_slots = ErrorOps.__extract_all_slots(flags, config or get_config())  # (N, num_slots)
         slot_codes = (all_slots >> CODE_SHIFT) & 0xF  # (N, num_slots)
         
         # code is (N,), need to compare per-sample
@@ -510,15 +519,16 @@ class ErrorOps:
         code_exists = matches.any(dim=1)  # (N,)
         # Use argmax with masking for first match index
         match_scores = matches.float()
-        positions = torch.arange(config.num_slots, device=flags.device, dtype=torch.float32)
+        cache = get_device_cache()
+        positions = cache.get_position_array(flags.device, torch.float32, config.num_slots)
         scores = match_scores - positions * 1e-6
-        scores = torch.where(matches, scores, torch.tensor(-float('inf'), device=flags.device))
+        scores = torch.where(matches, scores, float('-inf'))
         existing_slot_idx = scores.argmax(dim=1)  # (N,)
         
         return torch.where(
             (code_exists & should_push).unsqueeze(-1),
-            ErrorOps.__update_slot_if_worse(flags, existing_slot_idx, new_slot, config),
-            torch.where((~code_exists & should_push).unsqueeze(-1), ErrorOps.__push_no_dedupe(flags, code, location, severity, config), flags)
+            ErrorOps.__update_slot_if_worse(flags, existing_slot_idx, new_slot, config or get_config()),
+            torch.where((~code_exists & should_push).unsqueeze(-1), ErrorOps.__push_no_dedupe(flags, code, location, severity, config or get_config()), flags)
         )
     
     @staticmethod
@@ -528,7 +538,7 @@ class ErrorOps:
         new_slot = ErrorOps.__pack_slot_tensor(code, location, severity)
         
         # Extract all slots and check for matching (location, code) pair
-        all_slots = ErrorOps.__extract_all_slots(flags, config)  # (N, num_slots)
+        all_slots = ErrorOps.__extract_all_slots(flags, config or get_config())  # (N, num_slots)
         slot_loc = (all_slots >> LOCATION_SHIFT) & 0x3FF  # (N, num_slots)
         slot_codes = (all_slots >> CODE_SHIFT) & 0xF  # (N, num_slots)
         
@@ -539,31 +549,33 @@ class ErrorOps:
         pair_exists = matches.any(dim=1)  # (N,)
         # Use argmax with masking for first match index
         match_scores = matches.float()
-        positions = torch.arange(config.num_slots, device=flags.device, dtype=torch.float32)
+        cache = get_device_cache()
+        positions = cache.get_position_array(flags.device, torch.float32, config.num_slots)
         scores = match_scores - positions * 1e-6
-        scores = torch.where(matches, scores, torch.tensor(-float('inf'), device=flags.device))
+        scores = torch.where(matches, scores, float('-inf'))
         existing_slot_idx = scores.argmax(dim=1)  # (N,)
         
         return torch.where(
             (pair_exists & should_push).unsqueeze(-1),
-            ErrorOps.__update_slot_if_worse(flags, existing_slot_idx, new_slot, config),
-            torch.where((~pair_exists & should_push).unsqueeze(-1), ErrorOps.__push_no_dedupe(flags, code, location, severity, config), flags)
+            ErrorOps.__update_slot_if_worse(flags, existing_slot_idx, new_slot, config or get_config()),
+            torch.where((~pair_exists & should_push).unsqueeze(-1), ErrorOps.__push_no_dedupe(flags, code, location, severity, config or get_config()), flags)
         )
     
     @staticmethod
     def __replace_slot(flags: Tensor, slot_idx: Tensor, new_slot: Tensor, config: ErrorConfig) -> Tensor:
         """Replace slot at given index with new value. Fully vectorized."""
-        return ErrorOps.__replace_slot_at(flags, slot_idx, new_slot, config)
+        return ErrorOps.__replace_slot_at(flags, slot_idx, new_slot, config or get_config())
     
     @staticmethod
     def __update_slot_if_worse(flags: Tensor, slot_idx: Tensor, new_slot: Tensor, config: ErrorConfig) -> Tensor:
         """Update slot only if new error is worse (higher severity). Fully vectorized."""
         # Extract all slots
-        all_slots = ErrorOps.__extract_all_slots(flags, config)  # (N, num_slots)
+        all_slots = ErrorOps.__extract_all_slots(flags, config or get_config())  # (N, num_slots)
         n, num_slots = all_slots.shape
         
         # Get existing slot at target index
-        indices = torch.arange(num_slots, device=flags.device).unsqueeze(0)  # (1, num_slots)
+        cache = get_device_cache()
+        indices = cache.get_slot_indices(flags.device, num_slots).unsqueeze(0)  # (1, num_slots)
         is_target = (indices == slot_idx.unsqueeze(1))  # (N, num_slots)
         
         # Get severity comparison
@@ -577,10 +589,10 @@ class ErrorOps:
         updated = torch.where(should_update, new_slot.unsqueeze(1), all_slots)
         
         # Pack back
-        return ErrorOps.__pack_all_slots(updated, config)
+        return ErrorOps.__pack_all_slots(updated, config or get_config())
     
     @staticmethod
-    def push_scalar(flags: Tensor[int64_t, ("N", "num_words")], code: int, location: int, severity: int = Severity.ERROR, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int64_t, ("N", "num_words")]:
+    def push_scalar(flags: Tensor[int64_t, ("N", "num_words")], code: int, location: int, severity: int = Severity.ERROR, config: Optional[ErrorConfig] = None) -> Tensor[int64_t, ("N", "num_words")]:
         """
         Push same error to all samples. Fully compilable.
         
@@ -606,14 +618,14 @@ class ErrorOps:
             return flags
         n = flags.shape[0]
         code_tensor = torch.full((n,), code, dtype=torch.int64, device=flags.device)
-        return ErrorOps.push(flags, code_tensor, location, severity, config)
+        return ErrorOps.push(flags, code_tensor, location, severity, config or get_config())
     
     # ═══════════════════════════════════════════════════════════════════════════
     # RECORDING - Merge Methods
     # ═══════════════════════════════════════════════════════════════════════════
     
     @staticmethod
-    def merge(*flag_tensors: Tensor[int64_t, ("N", "num_words")], config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int64_t, ("N", "num_words")]:
+    def merge(*flag_tensors: Tensor[int64_t, ("N", "num_words")], config: Optional[ErrorConfig] = None) -> Tensor[int64_t, ("N", "num_words")]:
         """
         Merge multiple flag tensors into one. Compilable.
         
@@ -642,15 +654,15 @@ class ErrorOps:
         
         result = flag_tensors[0]
         for other in flag_tensors[1:]:
-            result = ErrorOps.__merge_two(result, other, config)
+            result = ErrorOps.__merge_two(result, other, config or get_config())
         return result
     
     @staticmethod
     def __merge_two(flags: Tensor, other: Tensor, config: ErrorConfig) -> Tensor:
         """Merge errors from other into flags. Fully vectorized using stable sort."""
         # Extract all slots from both tensors
-        flags_slots = ErrorOps.__extract_all_slots(flags, config)  # (N, num_slots)
-        other_slots = ErrorOps.__extract_all_slots(other, config)  # (N, num_slots)
+        flags_slots = ErrorOps.__extract_all_slots(flags, config or get_config())  # (N, num_slots)
+        other_slots = ErrorOps.__extract_all_slots(other, config or get_config())  # (N, num_slots)
         
         # Concatenate: other first (newer in LIFO terms), then flags (older)
         combined = torch.cat([other_slots, flags_slots], dim=1)  # (N, 2*num_slots)
@@ -667,7 +679,7 @@ class ErrorOps:
         compacted = torch.gather(combined, 1, indices)
         
         # Take first num_slots and pack back
-        return ErrorOps.__pack_all_slots(compacted[:, :config.num_slots], config)
+        return ErrorOps.__pack_all_slots(compacted[:, :config.num_slots], config or get_config())
     
     @staticmethod
     def __push_slot(flags: Tensor, slot: Tensor, config: ErrorConfig) -> Tensor:
@@ -726,7 +738,7 @@ class ErrorOps:
         return (flags != 0).any(dim=-1)
     
     @staticmethod
-    def has_code(flags: Tensor[int64_t, ("N", "num_words")], code: int, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[bool_t, ("N",)]:
+    def has_code(flags: Tensor[int64_t, ("N", "num_words")], code: int, config: Optional[ErrorConfig] = None) -> Tensor[bool_t, ("N",)]:
         """
         Check if any slot contains specific error code. Compilable.
         
@@ -749,7 +761,8 @@ class ErrorOps:
         device = flags.device
         dtype = flags.dtype
         
-        slot_shifts = torch.arange(SLOTS_PER_WORD, device=device, dtype=dtype) * SLOT_BITS
+        cache = get_device_cache()
+        slot_shifts = cache.get_slot_shifts(device, dtype, SLOTS_PER_WORD, SLOT_BITS)
         words = flags.unsqueeze(-1)
         slots = (words >> slot_shifts) & SLOT_MASK
         
@@ -760,7 +773,7 @@ class ErrorOps:
         return matches.any(dim=(1, 2))
     
     @staticmethod
-    def has_nan(flags: Tensor[int64_t, ("N", "num_words")], config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[bool_t, ("N",)]:
+    def has_nan(flags: Tensor[int64_t, ("N", "num_words")], config: Optional[ErrorConfig] = None) -> Tensor[bool_t, ("N",)]:
         """
         Check if any slot has NaN error. Compilable.
         
@@ -777,10 +790,10 @@ class ErrorOps:
         Example:
             >>> if ErrorOps.has_nan(flags).any(): print("NaN detected")
         """
-        return ErrorOps.has_code(flags, ErrorCode.NAN, config)
+        return ErrorOps.has_code(flags, ErrorCode.NAN, config or get_config())
     
     @staticmethod
-    def has_inf(flags: Tensor[int64_t, ("N", "num_words")], config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[bool_t, ("N",)]:
+    def has_inf(flags: Tensor[int64_t, ("N", "num_words")], config: Optional[ErrorConfig] = None) -> Tensor[bool_t, ("N",)]:
         """
         Check if any slot has Inf error. Compilable.
         
@@ -794,10 +807,10 @@ class ErrorOps:
         Returns:
             (Tensor[bool_t, (N,)]): True where Inf error found
         """
-        return ErrorOps.has_code(flags, ErrorCode.INF, config)
+        return ErrorOps.has_code(flags, ErrorCode.INF, config or get_config())
     
     @staticmethod
-    def has_critical(flags: Tensor[int64_t, ("N", "num_words")], config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[bool_t, ("N",)]:
+    def has_critical(flags: Tensor[int64_t, ("N", "num_words")], config: Optional[ErrorConfig] = None) -> Tensor[bool_t, ("N",)]:
         """
         Check if any slot has CRITICAL severity. Compilable.
         
@@ -815,7 +828,8 @@ class ErrorOps:
         device = flags.device
         dtype = flags.dtype
         
-        slot_shifts = torch.arange(SLOTS_PER_WORD, device=device, dtype=dtype) * SLOT_BITS
+        cache = get_device_cache()
+        slot_shifts = cache.get_slot_shifts(device, dtype, SLOTS_PER_WORD, SLOT_BITS)
         words = flags.unsqueeze(-1)
         slots = (words >> slot_shifts) & SLOT_MASK
         severities = slots & 0x3
@@ -823,7 +837,7 @@ class ErrorOps:
         return (severities == Severity.CRITICAL).any(dim=(1, 2))
     
     @staticmethod
-    def has_fallback(flags: Tensor[int64_t, ("N", "num_words")], config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[bool_t, ("N",)]:
+    def has_fallback(flags: Tensor[int64_t, ("N", "num_words")], config: Optional[ErrorConfig] = None) -> Tensor[bool_t, ("N",)]:
         """
         Check if any slot indicates fallback value was used. Compilable.
         
@@ -837,10 +851,10 @@ class ErrorOps:
         Returns:
             (Tensor[bool_t, (N,)]): True where fallback was used
         """
-        return ErrorOps.has_code(flags, ErrorCode.FALLBACK_VALUE, config)
+        return ErrorOps.has_code(flags, ErrorCode.FALLBACK_VALUE, config or get_config())
     
     @staticmethod
-    def has_domain(flags: Tensor[int64_t, ("N", "num_words")], domain: int, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[bool_t, ("N",)]:
+    def has_domain(flags: Tensor[int64_t, ("N", "num_words")], domain: int, config: Optional[ErrorConfig] = None) -> Tensor[bool_t, ("N",)]:
         """
         Check if any slot has error in given domain. Compilable.
         
@@ -864,7 +878,8 @@ class ErrorOps:
         device = flags.device
         dtype = flags.dtype
         
-        slot_shifts = torch.arange(SLOTS_PER_WORD, device=device, dtype=dtype) * SLOT_BITS
+        cache = get_device_cache()
+        slot_shifts = cache.get_slot_shifts(device, dtype, SLOTS_PER_WORD, SLOT_BITS)
         words = flags.unsqueeze(-1)
         slots = (words >> slot_shifts) & SLOT_MASK
         
@@ -1165,7 +1180,7 @@ class ErrorOps:
         return torch.where(mask_expanded, flags_new, flags)
     
     @staticmethod
-    def and_then(flags: Tensor[int64_t, ("N", "num_words")], z: Tensor, fn: Callable[[Tensor], Tuple[Tensor, Tensor]], config: ErrorConfig = DEFAULT_CONFIG) -> Tuple[Tensor, Tensor[int64_t, ("N", "num_words")]]:
+    def and_then(flags: Tensor[int64_t, ("N", "num_words")], z: Tensor, fn: Callable[[Tensor], Tuple[Tensor, Tensor]], config: Optional[ErrorConfig] = None) -> Tuple[Tensor, Tensor[int64_t, ("N", "num_words")]]:
         """
         Strict Result-style chaining: only OK samples participate in fn.
         
@@ -1203,7 +1218,7 @@ class ErrorOps:
         # Only keep new flags where previously OK
         mask_ok_flags = mask_ok.unsqueeze(-1)
         flags_new_masked = torch.where(mask_ok_flags, flags_new, torch.zeros_like(flags_new))
-        flags_out = ErrorOps.merge(flags, flags_new_masked, config=config)
+        flags_out = ErrorOps.merge(flags, flags_new_masked, config=config or get_config())
         
         # Only update z where previously OK
         mask_expanded = ErrorOps.__broadcast_mask(mask_ok, z)
@@ -1212,7 +1227,7 @@ class ErrorOps:
         return z_out, flags_out
     
     @staticmethod
-    def bind(flags: Tensor[int64_t, ("N", "num_words")], z: Tensor, fn: Callable[[Tensor], Tuple[Tensor, Tensor]], config: ErrorConfig = DEFAULT_CONFIG) -> Tuple[Tensor, Tensor[int64_t, ("N", "num_words")]]:
+    def bind(flags: Tensor[int64_t, ("N", "num_words")], z: Tensor, fn: Callable[[Tensor], Tuple[Tensor, Tensor]], config: Optional[ErrorConfig] = None) -> Tuple[Tensor, Tensor[int64_t, ("N", "num_words")]]:
         """
         Monadic bind: apply fn, merge ALL errors, update values only for OK samples.
         
@@ -1243,7 +1258,7 @@ class ErrorOps:
         z_new, flags_new = fn(z)
         
         # Always accumulate flags (full error chain)
-        flags_out = ErrorOps.merge(flags, flags_new, config=config)
+        flags_out = ErrorOps.merge(flags, flags_new, config=config or get_config())
         
         # Only update z where previously OK
         mask_expanded = ErrorOps.__broadcast_mask(mask_ok, z)
@@ -1252,7 +1267,7 @@ class ErrorOps:
         return z_out, flags_out
     
     @staticmethod
-    def ensure_mask(flags: Tensor[int64_t, ("N", "num_words")], ok_mask: Tensor, code: int, location: int, severity: int = Severity.ERROR, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int64_t, ("N", "num_words")]:
+    def ensure_mask(flags: Tensor[int64_t, ("N", "num_words")], ok_mask: Tensor, code: int, location: int, severity: int = Severity.ERROR, config: Optional[ErrorConfig] = None) -> Tensor[int64_t, ("N", "num_words")]:
         """
         Push error for samples where ok_mask is False.
         
@@ -1274,15 +1289,12 @@ class ErrorOps:
             >>> flags = ErrorOps.ensure_mask(flags, ok_mask, ErrorCode.OUT_OF_BOUNDS, loc)
         """
         err_mask = ~ok_mask
-        code_tensor = torch.where(
-            err_mask,
-            torch.full((flags.shape[0],), code, dtype=torch.int64, device=flags.device),
-            torch.full((flags.shape[0],), ErrorCode.OK, dtype=torch.int64, device=flags.device),
-        )
-        return ErrorOps.push(flags, code_tensor, location, severity, config)
+        # Use scalar values in torch.where (PyTorch broadcasts automatically)
+        code_tensor = torch.where(err_mask, code, ErrorCode.OK).to(torch.int64)
+        return ErrorOps.push(flags, code_tensor, location, severity, config or get_config())
     
     @staticmethod
-    def guard(flags: Tensor[int64_t, ("N", "num_words")], z: Tensor, pred: Callable[[Tensor], Tensor], code: int, location: int, severity: int = Severity.ERROR, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int64_t, ("N", "num_words")]:
+    def guard(flags: Tensor[int64_t, ("N", "num_words")], z: Tensor, pred: Callable[[Tensor], Tensor], code: int, location: int, severity: int = Severity.ERROR, config: Optional[ErrorConfig] = None) -> Tensor[int64_t, ("N", "num_words")]:
         """
         Evaluate pred(z) and push errors where it returns False.
         
@@ -1306,10 +1318,10 @@ class ErrorOps:
             ...     ErrorCode.OUT_OF_BOUNDS, loc)
         """
         ok_mask = pred(z).to(torch.bool)
-        return ErrorOps.ensure_mask(flags, ok_mask, code, location, severity, config)
+        return ErrorOps.ensure_mask(flags, ok_mask, code, location, severity, config or get_config())
     
     @staticmethod
-    def recover_with_fallback(flags: Tensor[int64_t, ("N", "num_words")], z: Tensor, fallback: Tensor, location: int, severity: int = Severity.WARN, config: ErrorConfig = DEFAULT_CONFIG) -> Tuple[Tensor, Tensor[int64_t, ("N", "num_words")]]:
+    def recover_with_fallback(flags: Tensor[int64_t, ("N", "num_words")], z: Tensor, fallback: Tensor, location: int, severity: int = Severity.WARN, config: Optional[ErrorConfig] = None) -> Tuple[Tensor, Tensor[int64_t, ("N", "num_words")]]:
         """
         Replace error samples with fallback value and mark with FALLBACK_VALUE.
         
@@ -1339,12 +1351,9 @@ class ErrorOps:
         z_out = torch.where(mask_expanded, fallback_full, z)
         
         # Push FALLBACK_VALUE where we used fallback
-        code_tensor = torch.where(
-            mask_err,
-            torch.full((flags.shape[0],), ErrorCode.FALLBACK_VALUE, dtype=torch.int64, device=flags.device),
-            torch.full((flags.shape[0],), ErrorCode.OK, dtype=torch.int64, device=flags.device),
-        )
-        flags_out = ErrorOps.push(flags, code_tensor, location, severity, config)
+        # Use scalar values in torch.where (PyTorch broadcasts automatically)
+        code_tensor = torch.where(mask_err, ErrorCode.FALLBACK_VALUE, ErrorCode.OK).to(torch.int64)
+        flags_out = ErrorOps.push(flags, code_tensor, location, severity, config or get_config())
         
         return z_out, flags_out
     
@@ -1353,7 +1362,7 @@ class ErrorOps:
     # ═══════════════════════════════════════════════════════════════════════════
     
     @staticmethod
-    def count_errors(flags: Tensor[int64_t, ("N", "num_words")], config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int32_t, ("N",)]:
+    def count_errors(flags: Tensor[int64_t, ("N", "num_words")], config: Optional[ErrorConfig] = None) -> Tensor[int32_t, ("N",)]:
         """
         Count number of non-empty error slots per sample. Compilable.
         
@@ -1375,7 +1384,8 @@ class ErrorOps:
         device = flags.device
         dtype = flags.dtype
         
-        slot_shifts = torch.arange(SLOTS_PER_WORD, device=device, dtype=dtype) * SLOT_BITS
+        cache = get_device_cache()
+        slot_shifts = cache.get_slot_shifts(device, dtype, SLOTS_PER_WORD, SLOT_BITS)
         words = flags.unsqueeze(-1)
         slots = (words >> slot_shifts) & SLOT_MASK
         non_empty = (slots != 0)
@@ -1383,7 +1393,7 @@ class ErrorOps:
         return non_empty.sum(dim=(1, 2)).to(torch.int32)
     
     @staticmethod
-    def max_severity(flags: Tensor[int64_t, ("N", "num_words")], config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int64_t, ("N",)]:
+    def max_severity(flags: Tensor[int64_t, ("N", "num_words")], config: Optional[ErrorConfig] = None) -> Tensor[int64_t, ("N",)]:
         """
         Get maximum severity across all slots per sample. Compilable.
         
@@ -1406,7 +1416,8 @@ class ErrorOps:
         device = flags.device
         dtype = flags.dtype
         
-        slot_shifts = torch.arange(SLOTS_PER_WORD, device=device, dtype=dtype) * SLOT_BITS
+        cache = get_device_cache()
+        slot_shifts = cache.get_slot_shifts(device, dtype, SLOTS_PER_WORD, SLOT_BITS)
         words = flags.unsqueeze(-1)
         slots = (words >> slot_shifts) & SLOT_MASK
         severities = slots & 0x3
@@ -1483,7 +1494,7 @@ class ErrorOps:
         return ((flags[:, 0] >> LOCATION_SHIFT) & 0x3FF).to(torch.int32)
     
     @staticmethod
-    def clear(flags: Tensor[int64_t, ("N", "num_words")], code: int, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor[int64_t, ("N", "num_words")]:
+    def clear(flags: Tensor[int64_t, ("N", "num_words")], code: int, config: Optional[ErrorConfig] = None) -> Tensor[int64_t, ("N", "num_words")]:
         """
         Clear (remove) all occurrences of a specific error code from flags.
         
@@ -1507,7 +1518,8 @@ class ErrorOps:
         device = flags.device
         dtype = flags.dtype
         
-        slot_shifts = torch.arange(SLOTS_PER_WORD, device=device, dtype=dtype) * SLOT_BITS
+        cache = get_device_cache()
+        slot_shifts = cache.get_slot_shifts(device, dtype, SLOTS_PER_WORD, SLOT_BITS)
         words = flags.unsqueeze(-1)
         slots = (words >> slot_shifts) & SLOT_MASK
         slot_codes = (slots >> CODE_SHIFT) & 0xF

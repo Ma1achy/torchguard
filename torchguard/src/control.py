@@ -9,6 +9,11 @@ IMPORTANT:
 - Inside compiled code, use HAS/IS/OR/AND/NOT + IF/ELIF/ELSE.
 - At the Python boundary, use has_err(flags) from checks.py for Python bool.
 
+Implementation Note:
+    Uses torch.where instead of torch.cond for inductor backward pass compatibility.
+    Both branches are always evaluated (eager), then results are selected.
+    This is slightly less efficient but ensures gradients flow correctly.
+
 Example:
     from src.utils.errors.compiled.control import IF, HAS, IS, OR
     
@@ -20,43 +25,20 @@ Example:
 """
 from __future__ import annotations
 
+# Standard library
 from dataclasses import dataclass
-from typing import Callable, Generic, List, TypeVar
+from typing import Callable, Generic, List, Optional, TypeVar, Union
 
+# Third-party
 import torch
 from torch import Tensor
 
-# IMPORTANT: Import directly from helpers.py, NOT from __init__.py
+# Internal - Import directly from helpers.py, NOT from __init__.py
 # This avoids circular imports since __init__.py exports from control.py
+from .core.config import ErrorConfig, get_config
 from .err.helpers import find
-from .core.config import DEFAULT_CONFIG, ErrorConfig
 
 T = TypeVar("T")
-
-
-def _clone_outputs(result: T) -> T:
-    """
-    Clone tensor outputs to avoid aliasing issues with torch.cond.
-    
-    torch.cond doesn't support input-to-output aliasing in higher-order ops.
-    This helper ensures returned tensors are new objects.
-    
-    Args:
-        result: Any value, possibly containing tensors
-    
-    Returns:
-        The same structure with all tensors cloned
-    """
-    if isinstance(result, Tensor):
-        return result.clone()
-    elif isinstance(result, tuple):
-        return tuple(_clone_outputs(x) for x in result)
-    elif isinstance(result, list):
-        return [_clone_outputs(x) for x in result]
-    elif isinstance(result, dict):
-        return {k: _clone_outputs(v) for k, v in result.items()}
-    else:
-        return result
 
 
 __all__ = [
@@ -136,11 +118,11 @@ def HAS(flags: Tensor) -> Tensor:
     return _ensure_scalar(cond, "HAS(flags)")
 
 
-def IS(code: int, flags: Tensor, *, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor:
+def IS(code: int, flags: Tensor, *, config: Optional[ErrorConfig] = None) -> Tensor:
     """
     Tensor predicate: does any sample have this specific error code?
     
-    Essentially: find(code, flags, config).any() with validation.
+    Essentially: find(code, flags, config or get_config()).any() with validation.
     
     Args:
         code (int): Error code integer (e.g. ErrorCode.NAN)
@@ -160,7 +142,7 @@ def IS(code: int, flags: Tensor, *, config: ErrorConfig = DEFAULT_CONFIG) -> Ten
               .ELSE(lambda: (z, flags))
         )
     """
-    cond = find(code, flags, config=config).any()
+    cond = find(code, flags, config=config or get_config()).any()
     return _ensure_scalar(cond, f"IS({code}, flags)")
 
 
@@ -255,14 +237,57 @@ class _Branch(Generic[T]):
     fn: Callable[[], T]
 
 
+def _where_select(cond: Tensor, true_val: T, false_val: T) -> T:
+    """
+    Apply torch.where element-wise to potentially nested outputs.
+    
+    Handles tuples, lists, and single tensors. Non-tensor values pass through
+    from the true branch (assuming structure matches).
+    
+    Args:
+        cond: 0-D bool tensor condition
+        true_val: Result from the "true" branch
+        false_val: Result from the "false" branch
+    
+    Returns:
+        Selected values based on condition
+    """
+    if isinstance(true_val, Tensor):
+        # Broadcast scalar condition to match tensor shape
+        return torch.where(cond, true_val, false_val)
+    elif isinstance(true_val, tuple):
+        return tuple(
+            _where_select(cond, t, f)
+            for t, f in zip(true_val, false_val)
+        )
+    elif isinstance(true_val, list):
+        return [
+            _where_select(cond, t, f)
+            for t, f in zip(true_val, false_val)
+        ]
+    elif isinstance(true_val, dict):
+        return {
+            k: _where_select(cond, true_val[k], false_val[k])
+            for k in true_val
+        }
+    else:
+        # Non-tensor: return true_val (conditions should have same structure)
+        return true_val
+
+
 class _IfChain(Generic[T]):
     """
-    Internal IF/ELIF/ELSE chain builder.
+    Internal IF/ELIF/ELSE chain builder using torch.where.
     
     Use via IF(cond, fn).ELIF(cond2, fn2).ELSE(else_fn).
     
-    Eager mode: Uses Python if/elif/else for debugging.
-    Compiled mode: Uses nested torch.cond calls.
+    Implementation:
+        - Eager mode: Uses Python if/elif/else for debugging
+        - Compiled mode: Evaluates ALL branches, uses torch.where to select
+        
+    Note:
+        Unlike torch.cond, this evaluates all branches (slightly less efficient)
+        but ensures proper gradient flow for inductor backward pass.
     """
     
     def __init__(self, first_branch: _Branch[T]) -> None:
@@ -293,54 +318,48 @@ class _IfChain(Generic[T]):
         """
         Finalize the chain with an else branch.
         
-        Performance Note:
-            Eager fallback uses Python control flow (faster for debugging).
-            Compiled mode uses nested torch.cond (fully traceable).
+        Implementation:
+            - Eager mode: Python control flow (short-circuit, efficient)
+            - Compiled mode: torch.where selection (all branches evaluated)
         
         Constraints (for torch.compile):
             - All branches must return the same type/structure T
-            - Branch functions must be side-effect-free
+            - Branch functions should be cheap (all are evaluated in compiled mode)
         
         Args:
             else_fn (Callable[[], T]): Else branch body
         
         Returns:
-            (T): Result from the taken branch
+            (T): Result from the taken branch (eager) or selected result (compiled)
         """
         if not self.__branches:
             return else_fn()
         
-        # Eager mode: Python control flow
+        # Eager mode: Python control flow (short-circuit evaluation)
         if not torch.compiler.is_compiling():
             for br in self.__branches:
                 if br.cond.item():
                     return br.fn()
             return else_fn()
         
-        # Compiled mode: nested torch.cond
-        # Wrap functions to clone outputs, avoiding aliasing issues with torch.cond
-        def wrap_fn(fn: Callable[[], T]) -> Callable[[], T]:
-            def wrapped() -> T:
-                return _clone_outputs(fn())
-            return wrapped
+        # Compiled mode: evaluate all branches, select with torch.where
+        # This ensures gradient flow works correctly with inductor
         
-        wrapped_else = wrap_fn(else_fn)
-        wrapped_branches = [(br.cond, wrap_fn(br.fn)) for br in self.__branches]
+        # Start with else result
+        result = else_fn()
         
-        def build(idx: int) -> T:
-            if idx == len(wrapped_branches) - 1:
-                cond, fn = wrapped_branches[idx]
-                return torch.cond(cond, fn, wrapped_else)
-            
-            cond, fn = wrapped_branches[idx]
-            return torch.cond(cond, fn, lambda: build(idx + 1))
+        # Apply branches in reverse order (last ELIF first, then IF)
+        # This gives correct priority: IF > ELIF1 > ELIF2 > ... > ELSE
+        for br in reversed(self.__branches):
+            branch_result = br.fn()
+            result = _where_select(br.cond, branch_result, result)
         
-        return build(0)
+        return result
 
 
 def IF(cond: Tensor, then_fn: Callable[[], T]) -> _IfChain[T]:
     """
-    Start an IF/ELIF/ELSE chain.
+    Start an IF/ELIF/ELSE chain using torch.where for selection.
     
     Args:
         cond (Tensor): 0-D bool tensor (use HAS/IS/OR/AND/NOT or comparisons)
@@ -351,15 +370,15 @@ def IF(cond: Tensor, then_fn: Callable[[], T]) -> _IfChain[T]:
     
     Example:
         z, flags = (
-            IF(IS(ErrorCode.NAN, flags), lambda: fix(z, flags, self))
-              .ELIF(IS(ErrorCode.OUT_OF_BOUNDS, flags), lambda: self.handle_oob(z, flags))
+            IF(IS(ErrorCode.NAN, flags), lambda: (err.replace(z, 0.0, [err.NAN]), flags))
+              .ELIF(IS(ErrorCode.INF, flags), lambda: (torch.clamp(z, -10, 10), flags))
               .ELSE(lambda: (z, flags))
         )
     
     Notes:
-        - All branches must return same type for torch.compile
-        - Eager mode uses Python control flow
-        - Compiled mode uses nested torch.cond
+        - All branches must return same type/structure for torch.compile
+        - Eager mode uses Python control flow (efficient, short-circuit)
+        - Compiled mode uses torch.where (all branches evaluated, gradient-safe)
     """
     cond = _ensure_scalar(cond, "IF condition")
     return _IfChain(_Branch(cond, then_fn))

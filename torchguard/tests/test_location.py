@@ -25,12 +25,13 @@ from torchguard import (
     Order,
     Dedupe,
     ErrorConfig,
-    DEFAULT_CONFIG,
+    CONFIG,
     error_t,
     err,
     flags as flags_ns,
 )
-from torchguard.src.core.location import (
+# Internal location utilities for testing
+from ..src.core.location import (
     LocationTree,
     WeightedLocationTree,
     extract_locations,
@@ -1170,7 +1171,7 @@ class TestReprMethod:
     
     def test_repr_with_errors(self) -> None:
         """repr() should show error summary."""
-        from torchguard.src.err.helpers import push
+        from torchguard import push
         
         f = err.new_t(3)
         f = push(f, ErrorCode.NAN, "encoder.layer0", where=torch.tensor([True, True, False]))
@@ -1264,12 +1265,13 @@ class TestErrorConfigStrictValidation:
         assert config.strict_validation is True
     
     def test_default_config_has_strict_false(self) -> None:
-        """DEFAULT_CONFIG should have strict_validation=False."""
-        assert DEFAULT_CONFIG.strict_validation is False
+        """Global CONFIG should have strict_validation=False by default."""
+        assert CONFIG.strict_validation is False
     
-    def test_config_is_frozen(self) -> None:
-        """Config should be immutable."""
-        config = ErrorConfig(strict_validation=True)
-        with pytest.raises(Exception):  # FrozenInstanceError
-            config.strict_validation = False
+    def test_config_is_mutable(self) -> None:
+        """Config should be mutable to allow user customization."""
+        config = ErrorConfig(strict_validation=True, flag_dtype=torch.int64)
+        # Should be able to modify it
+        config.strict_validation = False
+        assert config.strict_validation is False
 

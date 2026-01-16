@@ -29,8 +29,8 @@ from torchguard import (
     has_err,
     err,
     flags as flags_ns,
+    CONFIG,
 )
-from torchguard.src.core.config import DEFAULT_CONFIG
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -45,7 +45,7 @@ class TestErrorTNew:
         x = torch.randn(32, 16)
         flags = err.new(x)
         
-        assert flags.shape == (32, DEFAULT_CONFIG.num_words)
+        assert flags.shape == (32, CONFIG.num_words)
         assert flags.dtype == torch.int64
     
     def test_new_creates_zeros(self) -> None:
@@ -82,7 +82,7 @@ class TestErrorTNew:
         out, flags = compiled(x)
         
         assert out.shape == (16, 4)
-        assert flags.shape == (16, DEFAULT_CONFIG.num_words)
+        assert flags.shape == (16, CONFIG.num_words)
         assert (flags == 0).all()
 
 
@@ -228,7 +228,7 @@ class TestErrorTGetFilters:
         
         ok_flags = err.get_ok(flags)
         
-        assert ok_flags.shape == (8, DEFAULT_CONFIG.num_words)
+        assert ok_flags.shape == (8, CONFIG.num_words)
     
     def test_get_err_all_clean(self) -> None:
         """get_err returns empty when no errors."""
@@ -237,7 +237,7 @@ class TestErrorTGetFilters:
         
         err_flags = err.get_err(flags)
         
-        assert err_flags.shape == (0, DEFAULT_CONFIG.num_words)
+        assert err_flags.shape == (0, CONFIG.num_words)
     
     def test_get_ok_filters_correctly(self) -> None:
         """get_ok returns only flags for samples without errors."""
@@ -254,7 +254,7 @@ class TestErrorTGetFilters:
         ok_flags = err.get_ok(flags)
         
         # 8 samples - 3 errors = 5 OK samples
-        assert ok_flags.shape == (5, DEFAULT_CONFIG.num_words)
+        assert ok_flags.shape == (5, CONFIG.num_words)
         # All OK flags should be zero
         assert (ok_flags == 0).all()
     
@@ -273,7 +273,7 @@ class TestErrorTGetFilters:
         err_flags = err.get_err(flags)
         
         # 3 samples with errors
-        assert err_flags.shape == (3, DEFAULT_CONFIG.num_words)
+        assert err_flags.shape == (3, CONFIG.num_words)
         # All error flags should be non-zero
         assert (err_flags != 0).any(dim=-1).all()
 
@@ -442,7 +442,7 @@ class TestErrorTCompiles:
         out, flags = compiled(x)
         
         assert out.shape == (16, 4)
-        assert flags.shape == (16, DEFAULT_CONFIG.num_words)
+        assert flags.shape == (16, CONFIG.num_words)
     
     def test_dynamic_batch_size(self) -> None:
         """error_t.new handles dynamic batch sizes."""
@@ -464,7 +464,7 @@ class TestErrorTCompiles:
             x = torch.randn(batch_size, 8)
             out, flags = compiled(x)
             assert out.shape == (batch_size, 4)
-            assert flags.shape == (batch_size, DEFAULT_CONFIG.num_words)
+            assert flags.shape == (batch_size, CONFIG.num_words)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

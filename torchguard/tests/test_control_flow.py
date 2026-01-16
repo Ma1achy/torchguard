@@ -19,9 +19,10 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from torchguard import ErrorCode, ErrorLocation, err, push
-from torchguard.src.control import AND, HAS, IF, IS, NOT, OR, _ensure_scalar
-from torchguard.src.typing import bool_t, error_t
+from torchguard import ErrorCode, ErrorLocation, err, push, AND, HAS, IF, IS, NOT, OR
+from torchguard.typing import bool_t, error_t
+# Internal helper for validation testing
+from ..src.control import _ensure_scalar
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

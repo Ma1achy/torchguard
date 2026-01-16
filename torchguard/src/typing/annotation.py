@@ -2,9 +2,8 @@ import torch
 from typing import Any, Tuple, Optional, Union
 from ..err.result import Result, Ok, Err
 from .dim import _AttributeRef, _BroadcastMarker
-from .validation import DimensionMismatchError, DTypeMismatchError, DeviceMismatchError
 from .dtypes import PYTHON_TYPE_TO_TORCH_DTYPE
-from .errors import ValidationError
+from .errors import ValidationError, DimensionMismatchError, DTypeMismatchError, DeviceMismatchError
 
 __all__ = ['TensorAnnotation']
 
@@ -85,8 +84,12 @@ class TensorAnnotation:
         """
         if expected != actual:
             raise DimensionMismatchError(
-                name, str(expected_spec), expected, actual, 
-                tensor, function_name
+                message=f"Dimension '{expected_spec}' mismatch for '{name}': expected {expected}, got {actual}",
+                expected=expected,
+                actual=actual,
+                dim_name=str(expected_spec),
+                parameter=name,
+                function=function_name,
             )
     
     def __validate_named_dimension(self, name: str, expected_spec: str, actual: int, dim_registry: dict, tensor: torch.Tensor, function_name: Optional[str]) -> None:
@@ -107,8 +110,12 @@ class TensorAnnotation:
         if expected_spec in dim_registry:
             if dim_registry[expected_spec] != actual:
                 raise DimensionMismatchError(
-                    name, expected_spec, dim_registry[expected_spec], 
-                    actual, tensor, function_name
+                    message=f"Dimension '{expected_spec}' mismatch for '{name}': expected {dim_registry[expected_spec]}, got {actual}",
+                    expected=dim_registry[expected_spec],
+                    actual=actual,
+                    dim_name=expected_spec,
+                    parameter=name,
+                    function=function_name,
                 )
         else:
             dim_registry[expected_spec] = actual
@@ -130,8 +137,12 @@ class TensorAnnotation:
         """
         if expected != actual:
             raise DimensionMismatchError(
-                name, f"dim[{dim_idx}]", expected, actual, 
-                tensor, function_name
+                message=f"Dimension 'dim[{dim_idx}]' mismatch for '{name}': expected {expected}, got {actual}",
+                expected=expected,
+                actual=actual,
+                dim_name=f"dim[{dim_idx}]",
+                parameter=name,
+                function=function_name,
             )
     
     def __validate_single_dimension(self, name: str, dim_idx: int, expected_spec: Any, actual: int, dim_registry: dict, instance: Any, tensor: torch.Tensor, function_name: Optional[str] = None) -> None:
@@ -276,7 +287,13 @@ class TensorAnnotation:
             DTypeMismatchError: If dtype doesn't match
         """
         if self.dtype is not None and tensor.dtype != self.dtype:
-            raise DTypeMismatchError(name, self.dtype, tensor, function_name)
+            raise DTypeMismatchError(
+                message=f"dtype mismatch for '{name}': expected {self.dtype}, got {tensor.dtype}",
+                expected=self.dtype,
+                actual=tensor.dtype,
+                parameter=name,
+                function=function_name,
+            )
     
     def __validate_device(self, name: str, tensor: torch.Tensor, function_name: Optional[str]) -> None:
         """
@@ -294,7 +311,13 @@ class TensorAnnotation:
             expected_device = str(self.device)
             actual_device = str(tensor.device)
             if expected_device != actual_device:
-                raise DeviceMismatchError(name, expected_device, tensor, function_name)
+                raise DeviceMismatchError(
+                    message=f"device mismatch for '{name}': expected {expected_device}, got {actual_device}",
+                    expected=expected_device,
+                    actual=actual_device,
+                    parameter=name,
+                    function=function_name,
+                )
     
     def __validate_requires_grad(self, name: str, tensor: torch.Tensor) -> None:
         """

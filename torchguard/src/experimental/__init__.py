@@ -43,10 +43,10 @@ from .err import err
 from ..control import IF, HAS, AND, OR, NOT, _ensure_scalar
 
 # Import config
-from ..core.config import DEFAULT_CONFIG, ErrorConfig
+from ..core.config import ErrorConfig, get_config
 
 
-def IS(code: int, flags: Tensor, *, config: ErrorConfig = DEFAULT_CONFIG) -> Tensor:
+def IS(code: int, flags: Tensor, *, config: ErrorConfig = None) -> Tensor:
     """
     Experimental IS predicate: does any sample have this specific error code?
     

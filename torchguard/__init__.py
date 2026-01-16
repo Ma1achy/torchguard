@@ -29,7 +29,7 @@ from __future__ import annotations
 from .src.err import err
 
 # Python boundary operations namespace  
-from .src.err import flags, UnpackedError
+from .src.err import flags, UnpackedError, ErrorFlags
 
 # Type alias (for annotations)
 from .src.typing import error_t
@@ -50,7 +50,9 @@ from .src.core import (
     Severity,
     # Config
     AccumulationConfig,
-    DEFAULT_CONFIG,
+    CONFIG,
+    get_config,
+    set_config,
     Dedupe,
     ErrorConfig,
     Order,
@@ -95,6 +97,7 @@ from .src.err.helpers import (
     fix,
     flag_inf,
     flag_nan,
+    flag_nan_and_inf,
     flag_oob_indices,
     has_err,
     push,
@@ -119,6 +122,7 @@ __all__ = [
     # ═══════════════════════════════════════════════════════════════════════════
     # Unpacked error type
     'UnpackedError',
+    'ErrorFlags',
     # Core types
     'ErrorCode',
     'ErrorDomain',
@@ -130,7 +134,9 @@ __all__ = [
     'Order',
     'Dedupe',
     'ErrorConfig',
-    'DEFAULT_CONFIG',
+    'CONFIG',
+    'get_config',
+    'set_config',
     # Constants
     'SLOT_BITS',
     'SLOTS_PER_WORD',
@@ -151,6 +157,7 @@ __all__ = [
     'fix',
     'flag_nan',
     'flag_inf',
+    'flag_nan_and_inf',
     'flag_oob_indices',
     # Control Flow DSL
     'IF',
@@ -177,6 +184,8 @@ __all__ = [
     'InvalidReturnTypeError',
     # Experimental backend
     'experimental',
+    # Version
+    '__version__',
 ]
 
 __version__ = '0.1.0'

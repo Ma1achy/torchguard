@@ -14,8 +14,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from torchguard.src.decorators import as_result
-from torchguard import error_t, err, flags as flags_ns
+from torchguard import error_t, err, flags as flags_ns, as_result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
