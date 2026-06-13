@@ -1,0 +1,22 @@
+{
+  "name": "torchguard",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "onCreateCommand": "pip install --index-url https://download.pytorch.org/whl/cpu torch && pip install -e '.[dev]'",
+  "postCreateCommand": "pytest -q || true",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "ms-python.mypy-type-checker"
+      ],
+      "settings": {
+        "python.testing.pytestEnabled": true,
+        "editor.formatOnSave": true
+      }
+    }
+  }
+}
