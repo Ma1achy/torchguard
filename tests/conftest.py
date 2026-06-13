@@ -15,6 +15,7 @@ import torchguard as tg
 @pytest.fixture(autouse=True)
 def _reset_state():
     tg.set_config(tg.ErrorConfig())
+    tg.ErrorLocation.reset()
     torch._dynamo.reset()
     yield
     torch._dynamo.reset()

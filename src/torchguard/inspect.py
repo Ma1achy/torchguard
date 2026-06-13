@@ -10,6 +10,7 @@ from torch import Tensor
 from . import flags as F
 from .codes import ErrorCode
 from .config import ErrorConfig, get_config
+from .location import ErrorLocation
 
 __all__ = ["summary", "report"]
 
@@ -35,6 +36,6 @@ def report(flags: Tensor, config: ErrorConfig | None = None) -> str:
         errors = F.unpack(flags[i], config)
         total += len(errors)
         for code, loc, _sev in errors:
-            parts.append(f"s{i}:{ErrorCode.name(code)}@{loc}")
+            parts.append(f"s{i}:{ErrorCode.name(code)}@{ErrorLocation.name(loc)}")
     head = f"GuardedTensor({n} samples, {total} errors)"
     return head if not parts else f"{head}: " + ", ".join(parts)

@@ -87,7 +87,14 @@ a pre-wrapped tensor works. On torch 2.7.0 the full suite (including in-graph de
 under `fullgraph=True` inductor) passes. This matches the original project's own
 `fullgraph=True` recommendation of ≥ 2.7.
 
-Remaining phases: automatic module-tree location tracking (forward-hooks + contextvar;
-risk: contextvar under compile — spike first), full accumulation policies
-(FIFO/severity/dedupe), the tensor typing system + `@tensorcheck`/`@tracked`, and a
-README rewrite to the subclass API.
+**Location tracking (done, phase 3).** Risk R1 (contextvar under compile) was spiked and
+resolved: `ContextVar.set` is *not* traceable by Dynamo (`Unsupported: ... method 'set'
+of class 'ContextVar'`), so automatic contextvar locations are out. The implemented
+approach is **registry resolution** — `track(model)`/`@tracked` stamp each submodule's
+dotted path and register a small int id at construction time; inside `forward`,
+`flag_*(x, location=self)` resolves to a compile-time-constant id via attribute + dict
+lookups that Dynamo constant-folds (verified to bake correct per-submodule locations
+under `fullgraph=True` on both eager and inductor backends).
+
+Remaining phases: full accumulation policies (FIFO/severity/dedupe), the tensor typing
+system + `@tensorcheck`, and a README rewrite to the subclass API.

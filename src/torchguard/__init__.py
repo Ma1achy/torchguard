@@ -21,7 +21,9 @@ from __future__ import annotations
 from . import flags, inspect
 from .codes import ErrorCode, ErrorDomain
 from .config import CONFIG, ErrorConfig, get_config, set_config
+from .decorators import track, tracked
 from .detect import flag_inf, flag_nan, flag_nan_inf
+from .location import ErrorLocation, resolve_location
 from .severity import Severity
 from .tensor import GuardedTensor, guard
 
@@ -33,6 +35,10 @@ __all__ = [
     "flag_nan",
     "flag_inf",
     "flag_nan_inf",
+    "track",
+    "tracked",
+    "ErrorLocation",
+    "resolve_location",
     "ErrorCode",
     "ErrorDomain",
     "Severity",

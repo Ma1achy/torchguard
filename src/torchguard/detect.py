@@ -4,8 +4,9 @@ These return a ``GuardedTensor`` and are safe inside compiled regions (pure
 tensor ops). Detection is explicit rather than per-op-automatic because the
 per-sample reduction has a real cost; call it at the points you care about.
 
-``location`` is an integer id for now; automatic module-tree location tracking
-is added in a later phase.
+``location`` accepts an ``nn.Module`` (resolved to its tracked path id), an int
+id, a path string, or ``None``. Pass ``location=self`` inside a module's forward
+after running ``track``/``@tracked`` to get precise, compile-safe locations.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from torch import Tensor
 from . import flags as F
 from .codes import ErrorCode
 from .config import ErrorConfig, get_config
+from .location import Where, resolve_location
 from .tensor import GuardedTensor, guard
 
 __all__ = ["flag_nan", "flag_inf", "flag_nan_inf"]
@@ -35,29 +37,32 @@ def _detect(data: Tensor, predicate: Tensor, code: int, flags: Tensor, location:
     return F.push(flags, code_t, location, ErrorCode.default_severity(code), config)
 
 
-def flag_nan(x: Tensor | GuardedTensor, location: int = 0,
+def flag_nan(x: Tensor | GuardedTensor, location: Where = None,
              config: ErrorConfig | None = None) -> GuardedTensor:
     """Record ``ErrorCode.NAN`` for any sample of ``x`` containing a NaN."""
     config = config or get_config()
+    loc = resolve_location(location)
     data, flags = _split(x, config)
-    new_flags = _detect(data, torch.isnan(data), ErrorCode.NAN, flags, location, config)
+    new_flags = _detect(data, torch.isnan(data), ErrorCode.NAN, flags, loc, config)
     return GuardedTensor(data, new_flags)
 
 
-def flag_inf(x: Tensor | GuardedTensor, location: int = 0,
+def flag_inf(x: Tensor | GuardedTensor, location: Where = None,
              config: ErrorConfig | None = None) -> GuardedTensor:
     """Record ``ErrorCode.INF`` for any sample of ``x`` containing an Inf."""
     config = config or get_config()
+    loc = resolve_location(location)
     data, flags = _split(x, config)
-    new_flags = _detect(data, torch.isinf(data), ErrorCode.INF, flags, location, config)
+    new_flags = _detect(data, torch.isinf(data), ErrorCode.INF, flags, loc, config)
     return GuardedTensor(data, new_flags)
 
 
-def flag_nan_inf(x: Tensor | GuardedTensor, location: int = 0,
+def flag_nan_inf(x: Tensor | GuardedTensor, location: Where = None,
                  config: ErrorConfig | None = None) -> GuardedTensor:
     """Record NaN and Inf errors for ``x`` in a single call (NaN slot first)."""
     config = config or get_config()
+    loc = resolve_location(location)
     data, flags = _split(x, config)
-    flags = _detect(data, torch.isnan(data), ErrorCode.NAN, flags, location, config)
-    flags = _detect(data, torch.isinf(data), ErrorCode.INF, flags, location, config)
+    flags = _detect(data, torch.isnan(data), ErrorCode.NAN, flags, loc, config)
+    flags = _detect(data, torch.isinf(data), ErrorCode.INF, flags, loc, config)
     return GuardedTensor(data, flags)
