@@ -77,8 +77,15 @@ and friends now share one `num_slots`-respecting slot extractor).
 
 This PR is the **foundation + core engine** (rewrite phases 1–2):
 `src/torchguard/` layout, `pyproject.toml`, devcontainer, CI matrix (py3.10–3.12 ×
-torch floor/latest), ruff + mypy + pre-commit, and a working `GuardedTensor` core with
-the spike promoted into regression tests.
+torch floor `2.7.0`/latest), ruff + mypy + pre-commit, and a working `GuardedTensor` core
+with the spike promoted into regression tests.
+
+**Supported torch floor: ≥ 2.7.** Verified locally: on torch 2.4.1, constructing a
+`GuardedTensor` *inside* a compiled region (in-graph detection) is not traceable by
+Dynamo (`Unsupported: call_function UserDefinedClassVariable`), while propagation through
+a pre-wrapped tensor works. On torch 2.7.0 the full suite (including in-graph detection
+under `fullgraph=True` inductor) passes. This matches the original project's own
+`fullgraph=True` recommendation of ≥ 2.7.
 
 Remaining phases: automatic module-tree location tracking (forward-hooks + contextvar;
 risk: contextvar under compile — spike first), full accumulation policies

@@ -49,7 +49,7 @@ class GuardedTensor(torch.Tensor):
         self._data = data
         self._flags = flags
 
-    def __repr__(self) -> str:  # pragma: no cover - debug aid
+    def __repr__(self) -> str:  # type: ignore[override]  # pragma: no cover - debug aid
         # Must stay compile-safe: never force host values (no int()/.item()) here,
         # since torch may repr() a fake GuardedTensor while tracing.
         return f"GuardedTensor(shape={tuple(self.shape)}, dtype={self.dtype}, words={self._flags.shape[-1]})"
@@ -68,7 +68,7 @@ class GuardedTensor(torch.Tensor):
         return f"GuardedTensor(dtype={self._flags.dtype},words={self._flags.shape[-1]})"
 
     @classmethod
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # noqa: ANN001
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[override]  # noqa: ANN001
         kwargs = kwargs or {}
         collected: list[Tensor] = []
 
