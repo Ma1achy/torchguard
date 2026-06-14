@@ -112,3 +112,22 @@ all vectorized and verified to compile under inductor. The README was rewritten 
 The rewrite is feature-complete: every concept from the original is ported, the confirmed
 audit bugs are fixed, and the package is installable with CI, a devcontainer, lint, and
 type-checking.
+
+**Hardening / edge-case pass (done).** A round of unit/integration/e2e/edge tests surfaced
+and fixed several real bugs:
+
+- **`flag_*` broke autograd.** Detection unwrapped to the inner `_data` and built a fresh
+  `GuardedTensor` (an autograd *leaf*), so backward through a flagged output failed. Fixed
+  by detecting via a *marker add* (`gx + GuardedTensor(zeros, error_flags)`) — a real
+  dispatch op that preserves gradients (verified eager + inductor, clean-data backward).
+- **Batch-dim slicing/indexing misaligned flags** (`gx[:2]`, `gx[mask]`): now realigned in
+  `__torch_dispatch__` for slice/index/index_select on dim 0; `cat` along dim 0
+  concatenates flags. Added boundary helpers `take_ok`/`take_err`/`partition`/`subset`.
+- **Empty batch crashed** (`reshape(0, -1)` in `extract_slots`) → use `flatten(1)`.
+- **`guard()` on a 0-d tensor** now raises a clear error.
+- **Device moves** (`.to(device)`) now carry flags to the output device.
+- **`merge` honors `dedupe`**, so auto-detection deduplicates too.
+- `subset` (not `select`) avoids shadowing `Tensor.select`.
+
+Test suite: 107 passing (+1 CUDA-skipped, +1 documented `mark_dynamic` xfail) on torch 2.7;
+ruff + mypy clean.

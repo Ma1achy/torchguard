@@ -65,7 +65,7 @@ def extract_slots(flags: Tensor, config: ErrorConfig | None = None) -> Tensor:
     shifts = torch.arange(spw, device=flags.device, dtype=flags.dtype) * SLOT_BITS
     # (N, num_words, 1) >> (spw,) -> (N, num_words, spw)
     slots = (flags.unsqueeze(-1) >> shifts) & SLOT_MASK
-    slots = slots.reshape(flags.shape[0], -1)
+    slots = slots.flatten(1)  # (N, num_words*spw); flatten (not reshape -1) handles N==0
     return slots[:, : config.num_slots]
 
 
@@ -129,17 +129,35 @@ def has_critical(flags: Tensor, config: ErrorConfig | None = None) -> Tensor:
     return (sev == Severity.CRITICAL).any(dim=1)
 
 
+def _dedupe_slots(combined: Tensor, dedupe: Dedupe) -> Tensor:
+    """Zero duplicate-key slots (keep the first), upgrading it to the group's
+    worst severity. O(m^2) in the slot count m, vectorized."""
+    m = combined.shape[1]
+    keys = _slot_key(combined, dedupe)
+    nonempty = combined != 0
+    same = (keys.unsqueeze(2) == keys.unsqueeze(1)) & nonempty.unsqueeze(2) & nonempty.unsqueeze(1)
+    earlier = torch.tril(torch.ones(m, m, dtype=torch.bool, device=combined.device), diagonal=-1)
+    is_dup = (same & earlier).any(dim=2)  # slot i repeats an earlier slot's key
+    sev = combined & SEVERITY_MASK
+    grp_max_sev = torch.where(same, sev.unsqueeze(1), torch.zeros_like(sev).unsqueeze(1)).amax(dim=2)
+    upgraded = (combined & ~SEVERITY_MASK) | grp_max_sev
+    keep = nonempty & ~is_dup
+    return torch.where(keep, upgraded, torch.zeros_like(combined))
+
+
 def merge(a: Tensor, b: Tensor, config: ErrorConfig | None = None) -> Tensor:
     """Merge two flags tensors, keeping ``a``'s slots ahead of ``b``'s.
 
     Slots are compacted (non-empty first, order preserved) and truncated to
-    ``num_slots``. Equivalent to error accumulation with the slots of ``a``
-    treated as older/earlier.
+    ``num_slots``. When the configured ``dedupe`` policy is not ``NONE``,
+    duplicate-key errors are collapsed (keeping the worst severity).
     """
     config = config or get_config()
     sa = extract_slots(a, config)
     sb = extract_slots(b, config)
     combined = torch.cat([sa, sb], dim=1)
+    if config.accumulation.dedupe is not Dedupe.NONE:
+        combined = _dedupe_slots(combined, config.accumulation.dedupe)
     empty = (combined == 0).to(torch.int64)  # 0 -> keep first, 1 -> push to back
     _, idx = torch.sort(empty, dim=1, stable=True)
     compacted = torch.gather(combined, 1, idx)

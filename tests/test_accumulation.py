@@ -80,6 +80,20 @@ def test_dedupe_code_and_location():
     assert int(F.count(g, cfg_loc)[0]) == 1
 
 
+def test_dedupe_applies_to_detection_via_merge():
+    import torchguard as tg
+    from torchguard import flag_nan, guard
+
+    tg.set_config(ErrorConfig(num_slots=8, accumulation=AccumulationPolicy(dedupe=Dedupe.PAIR)))
+    d = torch.full((1, 4), float("nan"))
+    g = guard(d)
+    g = flag_nan(g, location=1)
+    g = flag_nan(g, location=1)  # same (loc, code) -> deduped, not a second slot
+    assert int(F.count(g.flags)[0]) == 1
+    g = flag_nan(g, location=2)  # different location -> new slot
+    assert int(F.count(g.flags)[0]) == 2
+
+
 def test_policy_default_is_lifo_none():
     p = ErrorConfig().accumulation
     assert p.order is Order.LIFO

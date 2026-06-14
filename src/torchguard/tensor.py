@@ -25,6 +25,52 @@ from .config import ErrorConfig, get_config
 
 __all__ = ["GuardedTensor", "guard"]
 
+_aten = torch.ops.aten
+
+
+def _combine_flags(func: Any, args: Any, collected: list[Tensor]) -> Tensor:
+    """Derive the output flags from the input flags for a dispatched op.
+
+    Most ops preserve the leading batch dimension, so the (merged) flags carry
+    through unchanged. A few ops change dim 0 and need special handling so the
+    per-sample channel stays aligned with the data:
+
+    * ``cat`` along dim 0 of all-guarded inputs -> concatenate the flags;
+    * ``slice`` / ``index`` / ``index_select`` along dim 0 -> subset the flags.
+
+    Ops that change the batch in other ways (``select``, ``stack``, reductions
+    over dim 0, mixed ``cat``) fall back to the merged flags, which no longer map
+    one-to-one onto the output rows — use the boundary helpers
+    (``take_ok``/``select``/``partition``) or ``unwrap()`` for those.
+    """
+    # cat along dim 0 of all-guarded inputs: concatenate, do not merge.
+    if func is _aten.cat.default and collected:
+        tensors = args[0]
+        dim = args[1] if len(args) > 1 else 0
+        if dim == 0 and len(collected) == len(tensors):
+            return torch.cat(collected, dim=0)
+
+    merged = collected[0]
+    for extra in collected[1:]:
+        merged = F.merge(merged, extra)
+
+    # dim-0 subsetting ops (single guarded input): subset the flags in lockstep.
+    if func is _aten.slice.Tensor:
+        if (args[1] if len(args) > 1 else 0) == 0:
+            start = args[2] if len(args) > 2 else None
+            end = args[3] if len(args) > 3 else None
+            step = args[4] if len(args) > 4 else 1
+            return merged[start:end:step]
+    elif func is _aten.index.Tensor:
+        idx = args[1]
+        if idx and isinstance(idx[0], Tensor):
+            return merged[idx[0]]
+    elif func is _aten.index_select.default:
+        if args[1] == 0:
+            return merged.index_select(0, args[2])
+
+    return merged
+
 
 class GuardedTensor(torch.Tensor):
     """A tensor that carries and auto-propagates a packed error-flag channel."""
@@ -78,18 +124,20 @@ class GuardedTensor(torch.Tensor):
                 return x._data
             return x
 
-        out = func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
+        new_args = tree_map(unwrap, args)
+        new_kwargs = tree_map(unwrap, kwargs)
+        out = func(*new_args, **new_kwargs)
 
         if not collected:
             return out
 
-        merged = collected[0]
-        for extra in collected[1:]:
-            merged = F.merge(merged, extra)
+        merged = _combine_flags(func, new_args, collected)
 
         def wrap(o: Any) -> Any:
             if isinstance(o, Tensor) and not isinstance(o, GuardedTensor):
-                return GuardedTensor(o, merged)
+                # Keep flags on the output's device (handles .to(device)/.cuda()).
+                f = merged if merged.device == o.device else merged.to(o.device)
+                return GuardedTensor(o, f)
             return o
 
         return tree_map(wrap, out)
@@ -116,13 +164,36 @@ class GuardedTensor(torch.Tensor):
         """Per-sample bool mask of error-free samples."""
         return F.is_ok(self._flags)
 
+    def subset(self, index: Any) -> GuardedTensor:
+        """Subset samples by a mask/index/slice, keeping data and flags aligned.
+
+        Named ``subset`` (not ``select``) to avoid shadowing ``Tensor.select``.
+        """
+        return GuardedTensor(self._data[index], self._flags[index])
+
+    def take_ok(self) -> GuardedTensor:
+        """Return only the error-free samples (data and flags aligned)."""
+        return self.subset(F.is_ok(self._flags))
+
+    def take_err(self) -> GuardedTensor:
+        """Return only the samples that carry errors (data and flags aligned)."""
+        return self.subset(F.is_err(self._flags))
+
+    def partition(self) -> tuple[GuardedTensor, GuardedTensor]:
+        """Split into ``(ok_samples, error_samples)`` as aligned GuardedTensors."""
+        ok = F.is_ok(self._flags)
+        return self.subset(ok), self.subset(~ok)
+
 
 def guard(x: Tensor, config: ErrorConfig | None = None) -> GuardedTensor:
     """Wrap ``x`` in a ``GuardedTensor`` with an empty error channel.
 
-    Returns ``x`` unchanged if it is already a ``GuardedTensor``.
+    Returns ``x`` unchanged if it is already a ``GuardedTensor``. ``x`` must have a
+    leading batch dimension.
     """
     if isinstance(x, GuardedTensor):
         return x
+    if x.ndim == 0:
+        raise ValueError("guard() requires a tensor with a leading batch dimension, got a 0-d tensor")
     config = config or get_config()
     return GuardedTensor(x, F.new(x.shape[0], config, x.device))
