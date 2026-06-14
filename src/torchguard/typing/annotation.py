@@ -167,6 +167,13 @@ class TensorAnnotation:
             parts.append(f"requires_grad={self.requires_grad}")
         return f"Tensor[{', '.join(parts)}]"
 
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # Annotations are not callable. This exists only so that the instance
+        # satisfies ``typing._type_check`` (which requires a type *or* a
+        # callable), letting ``Optional[Tensor[...]]`` / ``Tensor[...] | None``
+        # work on Python 3.10 (3.11+ is lenient and accepts non-callables).
+        raise TypeError("Tensor[...] is a type annotation; call .validate() to check a tensor")
+
     def __or__(self, other: Any) -> Any:
         # Must use typing.Union, not ``self | other`` (that would recurse here).
         return Union[self, other]  # noqa: UP007

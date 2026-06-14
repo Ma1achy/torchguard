@@ -95,3 +95,17 @@ def test_validate_result_catches_dim_resolution_errors():
 def test_validate_accepts_guardedtensor():
     ann = Tensor[float32_t, ("N", "D")]
     assert ann.validate("x", guard(torch.randn(4, 8))) is True
+
+
+def test_annotation_is_union_compatible():
+    # Must not raise on Python 3.10 (typing._type_check requires type-or-callable).
+    from typing import Optional, get_args
+
+    ann = Tensor[float32_t, ("N",)]
+    assert ann in get_args(Optional[ann])  # noqa: UP045  (deliberately test Optional form)
+    assert ann in get_args(ann | None)
+
+
+def test_annotation_not_callable():
+    with pytest.raises(TypeError):
+        Tensor[float32_t, ("N",)](torch.randn(3))
