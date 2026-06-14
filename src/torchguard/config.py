@@ -6,15 +6,56 @@ backend: flags are always integers (``int64`` by default, ``int32`` optional).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import enum
+from dataclasses import dataclass, field
 
 import torch
 
 from .constants import SLOT_BITS
 
-__all__ = ["ErrorConfig", "CONFIG", "get_config", "set_config"]
+__all__ = [
+    "ErrorConfig",
+    "AccumulationPolicy",
+    "Order",
+    "Dedupe",
+    "CONFIG",
+    "get_config",
+    "set_config",
+]
 
 _SUPPORTED_DTYPES = (torch.int64, torch.int32)
+
+
+class Order(enum.Enum):
+    """Eviction order when a sample's slots are full."""
+
+    LIFO = "lifo"  # keep newest; insert at front, evict oldest
+    FIFO = "fifo"  # keep oldest (root cause); append, drop new when full
+
+
+class Dedupe(enum.Enum):
+    """How a new error is collapsed against existing slots."""
+
+    NONE = "none"  # every error gets its own slot
+    CODE = "code"  # one slot per error code
+    LOCATION = "location"  # one slot per location
+    PAIR = "pair"  # one slot per (location, code)
+
+
+@dataclass
+class AccumulationPolicy:
+    """How errors accumulate into the fixed set of per-sample slots.
+
+    Args:
+        order: Eviction order when slots are full (``LIFO`` default).
+        dedupe: Collapse rule for matching errors (``NONE`` default).
+        evict_by_severity: When full under ``FIFO``, replace the lowest-severity
+            slot if the incoming error is more severe.
+    """
+
+    order: Order = Order.LIFO
+    dedupe: Dedupe = Dedupe.NONE
+    evict_by_severity: bool = False
 
 
 @dataclass
@@ -24,10 +65,12 @@ class ErrorConfig:
     Args:
         num_slots: Number of error slots per sample (each slot is one error).
         flag_dtype: Integer storage dtype (``torch.int64`` or ``torch.int32``).
+        accumulation: How errors accumulate into the slots.
     """
 
     num_slots: int = 16
     flag_dtype: torch.dtype = torch.int64
+    accumulation: AccumulationPolicy = field(default_factory=AccumulationPolicy)
 
     def __post_init__(self) -> None:
         if self.num_slots < 1:

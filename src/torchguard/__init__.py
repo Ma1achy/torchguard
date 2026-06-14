@@ -20,7 +20,15 @@ from __future__ import annotations
 
 from . import flags, inspect, typing
 from .codes import ErrorCode, ErrorDomain
-from .config import CONFIG, ErrorConfig, get_config, set_config
+from .config import (
+    CONFIG,
+    AccumulationPolicy,
+    Dedupe,
+    ErrorConfig,
+    Order,
+    get_config,
+    set_config,
+)
 from .decorators import track, tracked
 from .detect import flag_inf, flag_nan, flag_nan_inf
 from .location import ErrorLocation, resolve_location
@@ -49,6 +57,9 @@ __all__ = [
     "ErrorDomain",
     "Severity",
     "ErrorConfig",
+    "AccumulationPolicy",
+    "Order",
+    "Dedupe",
     "CONFIG",
     "get_config",
     "set_config",

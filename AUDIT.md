@@ -103,5 +103,12 @@ also catches `AttributeError`/`TypeError` from `Dim` resolution). `@tensorcheck`
 shapes/dtypes from type hints (raises on mismatch, eager-only) and optionally auto-flags
 NaN/Inf into the returned `GuardedTensor` at the module's location (compiles).
 
-Remaining phases: full accumulation policies (FIFO/severity/dedupe) and a README rewrite
-to the subclass API.
+**Accumulation policies (done) + README (done).** `ErrorConfig.accumulation`
+(`AccumulationPolicy`) now controls eviction order (LIFO/FIFO), dedupe
+(none/code/location/pair, upgrading to the worst severity), and severity-based eviction —
+all vectorized and verified to compile under inductor. The README was rewritten to the
+`GuardedTensor` API.
+
+The rewrite is feature-complete: every concept from the original is ported, the confirmed
+audit bugs are fixed, and the package is installable with CI, a devcontainer, lint, and
+type-checking.

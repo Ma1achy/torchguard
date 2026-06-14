@@ -226,17 +226,30 @@ Error codes are grouped into domains (`NUMERIC`, `INDEX`, `QUALITY`, `RUNTIME`) 
 
 ```python
 import torch
-from torchguard import ErrorConfig, get_config, set_config
+from torchguard import ErrorConfig, AccumulationPolicy, Order, Dedupe, set_config
 
-set_config(ErrorConfig(num_slots=32, flag_dtype=torch.int64))
-get_config().num_words      # storage words per sample for the current layout
+set_config(ErrorConfig(
+    num_slots=32,
+    flag_dtype=torch.int64,
+    accumulation=AccumulationPolicy(
+        order=Order.FIFO,        # keep oldest (root cause) when slots fill up
+        dedupe=Dedupe.PAIR,      # one slot per (location, code)
+        evict_by_severity=True,  # under FIFO, a more severe error can evict a milder one
+    ),
+))
 ```
 
 * `num_slots` — error slots per sample (default 16).
 * `flag_dtype` — `torch.int64` (default, 4 slots/word) or `torch.int32` (2 slots/word).
+* `accumulation` — how errors fill the fixed slots:
+  * `order` — `LIFO` (default, keep newest) or `FIFO` (keep oldest / root cause).
+  * `dedupe` — `NONE` (default), `CODE`, `LOCATION`, or `PAIR` (one slot per
+    location+code; the kept slot upgrades to the worst severity seen).
+  * `evict_by_severity` — under `FIFO`, replace the lowest-severity slot when full if the
+    incoming error is more severe.
 
-When two guarded tensors meet, their slots are merged and compacted (newest kept first,
-truncated to `num_slots`).
+All policies are vectorized and `torch.compile`-safe. When two guarded tensors meet,
+their slots are merged and compacted (truncated to `num_slots`).
 
 ---
 
@@ -247,8 +260,8 @@ truncated to `num_slots`).
   on decorated functions are not validated.
 * Detection (`flag_nan`/`flag_inf`) is explicit by design — per-op auto-detection would
   add a reduction to every operation.
-* This is a rewrite in progress; richer accumulation policies (FIFO / severity / dedupe)
-  are on the roadmap (the current policy is newest-first).
+* Deduplication applies to `flag_*`/`push`; merging two guarded tensors compacts slots but
+  does not itself deduplicate across them.
 
 ---
 
