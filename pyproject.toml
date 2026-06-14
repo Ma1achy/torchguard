@@ -47,7 +47,9 @@ select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["B", "E731"]
+# F821: dim-name strings ("N", "D") inside Tensor[...] annotations are flagged
+# as forward references by ruff; they are intentional in our typing DSL.
+"tests/*" = ["B", "E731", "F821"]
 
 [tool.mypy]
 python_version = "3.10"

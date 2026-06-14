@@ -18,7 +18,7 @@ Quick start::
 """
 from __future__ import annotations
 
-from . import flags, inspect
+from . import flags, inspect, typing
 from .codes import ErrorCode, ErrorDomain
 from .config import CONFIG, ErrorConfig, get_config, set_config
 from .decorators import track, tracked
@@ -26,6 +26,8 @@ from .detect import flag_inf, flag_nan, flag_nan_inf
 from .location import ErrorLocation, resolve_location
 from .severity import Severity
 from .tensor import GuardedTensor, guard
+from .tensorcheck import tensorcheck
+from .typing import Broadcast, Dim, Tensor
 
 __version__ = "0.2.0"
 
@@ -37,6 +39,10 @@ __all__ = [
     "flag_nan_inf",
     "track",
     "tracked",
+    "tensorcheck",
+    "Tensor",
+    "Dim",
+    "Broadcast",
     "ErrorLocation",
     "resolve_location",
     "ErrorCode",
@@ -48,5 +54,6 @@ __all__ = [
     "set_config",
     "flags",
     "inspect",
+    "typing",
     "__version__",
 ]

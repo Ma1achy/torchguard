@@ -96,5 +96,12 @@ dotted path and register a small int id at construction time; inside `forward`,
 lookups that Dynamo constant-folds (verified to bake correct per-submodule locations
 under `fullgraph=True` on both eager and inductor backends).
 
-Remaining phases: full accumulation policies (FIFO/severity/dedupe), the tensor typing
-system + `@tensorcheck`, and a README rewrite to the subclass API.
+**Tensor typing + `@tensorcheck` (done, phase 4).** Ported `Tensor[dtype, shape]`
+annotations with named dims, `Dim` attribute refs, `Broadcast`, `Ellipsis`, dtype
+aliases, and the validation engine — fixing the confirmed `validate_result` bug (it now
+also catches `AttributeError`/`TypeError` from `Dim` resolution). `@tensorcheck` validates
+shapes/dtypes from type hints (raises on mismatch, eager-only) and optionally auto-flags
+NaN/Inf into the returned `GuardedTensor` at the module's location (compiles).
+
+Remaining phases: full accumulation policies (FIFO/severity/dedupe) and a README rewrite
+to the subclass API.
