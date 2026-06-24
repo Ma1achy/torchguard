@@ -30,7 +30,7 @@ from .config import (
     set_config,
 )
 from .decorators import track, tracked
-from .detect import flag_inf, flag_nan, flag_nan_inf
+from .detect import fix, flag_inf, flag_nan, flag_nan_inf, flag_oob_indices
 from .location import ErrorLocation, resolve_location
 from .severity import Severity
 from .tensor import GuardedTensor, guard
@@ -45,6 +45,8 @@ __all__ = [
     "flag_nan",
     "flag_inf",
     "flag_nan_inf",
+    "flag_oob_indices",
+    "fix",
     "track",
     "tracked",
     "tensorcheck",
