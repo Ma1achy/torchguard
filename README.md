@@ -154,6 +154,34 @@ happens at trace time and becomes a compile-time constant, so it is `torch.compi
 
 ---
 
+## Detection & recovery
+
+Detection helpers record an error into the channel; recovery helpers also repair
+the data. All return a `GuardedTensor`, compile under `fullgraph=True`, and keep
+the autograd graph intact.
+
+```python
+from torchguard import ErrorCode, flag_nan, flag_inf, flag_nan_inf, flag_oob_indices, fix
+
+h = flag_nan_inf(h, location=self.ffn)          # record NaN and/or Inf
+
+# out-of-bounds indices (e.g. before an embedding lookup)
+ids = flag_oob_indices(ids, num_embeddings, location=self.emb)
+
+# replace bad samples with a fallback and record FALLBACK_VALUE (gradients flow)
+h = fix(h, fallback=0.0, location=self.ffn)           # fix every errored sample
+ids = fix(ids, fallback=0, codes=[ErrorCode.OUT_OF_BOUNDS])  # clamp only OOB samples
+emb_out = embedding(ids)                                # now safe; flags ride along
+```
+
+`fix` replaces every errored sample's values with `fallback` (or only those
+carrying one of `codes`), records `FALLBACK_VALUE`, and keeps prior errors. The
+replacement is a `torch.where`, so gradients still flow to the kept samples.
+
+Validated end to end on a Transformer encoder (self-attention/SDPA, LayerNorm,
+residuals, FFN) and an embedding LM, under `torch.compile` and `autocast`
+(bfloat16), with correct per-sample attribution and backward.
+
 ## `@tensorcheck` and tensor typing
 
 Annotate tensors with shapes/dtypes and validate them at runtime:
